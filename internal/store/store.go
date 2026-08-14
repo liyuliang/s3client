@@ -281,6 +281,50 @@ func (s *Store) UpdateAccount(a *model.Account) error {
 	return err
 }
 
+// ChangeMasterPassword 用新主密码重新派生密钥、重新加密所有账号密钥并更新校验器（事务保证原子性）。
+func (s *Store) ChangeMasterPassword(newPassword string) error {
+	accounts, err := s.ListAccounts()
+	if err != nil {
+		return err
+	}
+	salt, err := crypto.GenerateSalt()
+	if err != nil {
+		return err
+	}
+	newKey, err := crypto.DeriveKey(newPassword, salt)
+	if err != nil {
+		return err
+	}
+	verifier, err := crypto.CreateVerifier(newKey)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('salt', ?), ('verifier', ?)`, encodeBytes(salt), verifier); err != nil {
+		tx.Rollback()
+		return err
+	}
+	for _, a := range accounts {
+		enc, err := crypto.Encrypt(newKey, []byte(a.SecretAccessKey))
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET secret_access_key=? WHERE id=?`, enc, a.ID); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.key = newKey
+	return nil
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1

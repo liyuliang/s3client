@@ -102,7 +102,7 @@ func showUnlock(w fyne.Window) {
 
 	doUnlock := func() {
 		if pwd.Text == "" {
-			dialog.ShowInformation("提示", "主密码不能为空", w)
+			showInfo("提示", "主密码不能为空", w)
 			return
 		}
 		var s *store.Store
@@ -162,6 +162,7 @@ type tappableRow struct {
 	meta         []string
 	icon         fyne.Resource
 	selected     bool
+	nameColor    color.Color
 	onTapped     func()
 	onDoubleTap  func()
 	secondaryTap func()
@@ -169,6 +170,11 @@ type tappableRow struct {
 
 func (r *tappableRow) withSecondary(fn func()) *tappableRow {
 	r.secondaryTap = fn
+	return r
+}
+
+func (r *tappableRow) withColor(c color.Color) *tappableRow {
+	r.nameColor = c
 	return r
 }
 
@@ -212,15 +218,28 @@ func (r *tappableRow) CreateRenderer() fyne.WidgetRenderer {
 	bg.CornerRadius = 4
 	bg.Hidden = !r.selected
 	icon := widget.NewIcon(r.icon)
-	label := widget.NewLabel(r.text)
-	left := container.NewHBox(icon, label)
+
+	var nameObj fyne.CanvasObject
+	var setText func(string)
+	if r.nameColor != nil {
+		t := canvas.NewText(r.text, r.nameColor)
+		t.TextSize = theme.TextSize()
+		nameObj = container.NewCenter(t)
+		setText = func(s string) { t.Text = s; t.Refresh() }
+	} else {
+		l := widget.NewLabel(r.text)
+		nameObj = l
+		setText = func(s string) { l.SetText(s) }
+	}
+
+	left := container.NewHBox(icon, nameObj)
 	var content *fyne.Container
 	if cols := newMetaCols(r.meta, false); cols != nil {
 		content = container.NewBorder(nil, nil, left, cols)
 	} else {
 		content = container.NewBorder(nil, nil, left, nil)
 	}
-	return &tappableRowRenderer{row: r, bg: bg, icon: icon, label: label,
+	return &tappableRowRenderer{row: r, bg: bg, icon: icon, setText: setText,
 		objects: []fyne.CanvasObject{bg, content}, content: content}
 }
 
@@ -228,7 +247,7 @@ type tappableRowRenderer struct {
 	row     *tappableRow
 	bg      *canvas.Rectangle
 	icon    *widget.Icon
-	label   *widget.Label
+	setText func(string)
 	content *fyne.Container
 	objects []fyne.CanvasObject
 }
@@ -252,8 +271,17 @@ func (rr *tappableRowRenderer) Refresh() {
 	rr.bg.Hidden = !rr.row.selected
 	rr.bg.FillColor = theme.Color(theme.ColorNameSelection)
 	rr.icon.SetResource(rr.row.icon)
-	rr.label.SetText(rr.row.text)
+	rr.setText(rr.row.text)
 	rr.bg.Refresh()
+}
+
+// showInfo 显示一个约 300px 宽的信息对话框（参数顺序与 dialog.ShowInformation 一致）。
+func showInfo(title, message string, w fyne.Window) {
+	lbl := widget.NewLabel(message)
+	lbl.Wrapping = fyne.TextWrapWord
+	content := container.NewVScroll(lbl)
+	content.SetMinSize(fyne.NewSize(300, 60))
+	dialog.ShowCustom(title, "确定", content, w)
 }
 
 // showProperties 弹出一个属性对话框，每个值放在可选中复制（Ctrl+C）的只读输入框里。
@@ -323,7 +351,7 @@ func showMain(w fyne.Window, s *store.Store) {
 	})
 	editBtn := widget.NewButtonWithIcon("编辑", theme.DocumentCreateIcon(), func() {
 		if selected < 0 || selected >= len(accounts) {
-			dialog.ShowInformation("提示", "请先选择一个账号", w)
+			showInfo("提示", "请先选择一个账号", w)
 			return
 		}
 		acc := accounts[selected]
@@ -331,7 +359,7 @@ func showMain(w fyne.Window, s *store.Store) {
 	})
 	delBtn := widget.NewButtonWithIcon("删除", theme.DeleteIcon(), func() {
 		if selected < 0 || selected >= len(accounts) {
-			dialog.ShowInformation("提示", "请先选择一个账号", w)
+			showInfo("提示", "请先选择一个账号", w)
 			return
 		}
 		acc := accounts[selected]
@@ -348,7 +376,7 @@ func showMain(w fyne.Window, s *store.Store) {
 	})
 	testBtn := widget.NewButton("测试连接", func() {
 		if selected < 0 || selected >= len(accounts) {
-			dialog.ShowInformation("提示", "请先选择一个账号", w)
+			showInfo("提示", "请先选择一个账号", w)
 			return
 		}
 		acc := accounts[selected]
@@ -362,12 +390,12 @@ func showMain(w fyne.Window, s *store.Store) {
 					dialog.ShowError(fmt.Errorf("连接失败: %w", err), w)
 					return
 				}
-				dialog.ShowInformation("连接成功", fmt.Sprintf("发现 %d 个桶", len(buckets)), w)
+				showInfo("连接成功", fmt.Sprintf("发现 %d 个桶", len(buckets)), w)
 			})
 		}()
 	})
 
-	toolbar := container.NewHBox(addBtn, editBtn, delBtn, testBtn)
+	toolbar := container.NewGridWithColumns(2, addBtn, editBtn, delBtn, testBtn)
 	leftPanel := container.NewBorder(toolbar, nil, nil, nil, accountScroll)
 
 	lockItem := fyne.NewMenuItem("加锁", func() {
@@ -401,7 +429,36 @@ func showMain(w fyne.Window, s *store.Store) {
 			})
 		}()
 	})
-	menu := fyne.NewMenu("菜单", lockItem, locItem)
+	changePwItem := fyne.NewMenuItem("修改主密码...", func() {
+		newPw := widget.NewPasswordEntry()
+		confirmPw := widget.NewPasswordEntry()
+		items := []*widget.FormItem{
+			widget.NewFormItem("新主密码", newPw),
+			widget.NewFormItem("确认新主密码", confirmPw),
+		}
+		form := widget.NewForm(items...)
+		formScroll := container.NewVScroll(form)
+		formScroll.SetMinSize(fyne.NewSize(380, 140))
+		dialog.ShowCustomConfirm("修改主密码", "确定", "取消", formScroll, func(ok bool) {
+			if !ok {
+				return
+			}
+			if newPw.Text == "" {
+				showInfo("提示", "新主密码不能为空", w)
+				return
+			}
+			if newPw.Text != confirmPw.Text {
+				showInfo("提示", "两次输入的主密码不一致", w)
+				return
+			}
+			if err := s.ChangeMasterPassword(newPw.Text); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			showInfo("完成", "主密码已更新", w)
+		}, w)
+	})
+	menu := fyne.NewMenu("菜单", lockItem, changePwItem, locItem)
 	w.SetMainMenu(fyne.NewMainMenu(menu))
 
 	split := container.NewHSplit(leftPanel, rightPanel)
@@ -425,21 +482,24 @@ func showBuckets(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Acc
 			for _, bi := range infos {
 				b := bi
 				status := "✓ 可访问"
-				if !b.Accessible {
-					status = "✗ 无权限"
-				}
 				accessPlain := "可访问"
-				if !b.Accessible {
+				var onOpen func()
+				rowColor := color.Color(color.NRGBA{R: 0x2e, G: 0xa0, B: 0x43, A: 0xff}) // 绿：可访问
+				if b.Accessible {
+					onOpen = func() { showObjects(w, setRight, acc, b.Name, "") }
+				} else {
+					status = "✗ 无权限"
 					accessPlain = "无权限"
+					rowColor = color.NRGBA{R: 0x80, G: 0x80, B: 0x80, A: 0xff} // 灰：无权限，onOpen 保持 nil 不能双击
 				}
-				row := newTappableRowDetail(b.Name, []string{"", "", status}, theme.StorageIcon(), nil,
-					func() { showObjects(w, setRight, acc, b.Name, "") },
-				).withSecondary(func() {
-					showProperties(w, "Bucket 属性", [][2]string{
-						{"名称", b.Name},
-						{"访问权限", accessPlain},
+				row := newTappableRowDetail(b.Name, []string{"", "", status}, theme.StorageIcon(), nil, onOpen).
+					withColor(rowColor).
+					withSecondary(func() {
+						showProperties(w, "Bucket 属性", [][2]string{
+							{"名称", b.Name},
+							{"访问权限", accessPlain},
+						})
 					})
-				})
 				list.Add(row)
 			}
 			title := widget.NewLabelWithStyle(
@@ -598,7 +658,7 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 					dialog.ShowError(e, w)
 					return
 				}
-				dialog.ShowInformation("完成", "上传成功", w)
+				showInfo("完成", "上传成功", w)
 				refresh()
 			})
 		}()
@@ -606,7 +666,7 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 
 	downloadBtn := widget.NewButtonWithIcon("下载文件", theme.DownloadIcon(), func() {
 		if selectedObj == nil || selectedObj.IsDir {
-			dialog.ShowInformation("提示", "请先选择一个文件", w)
+			showInfo("提示", "请先选择一个文件", w)
 			return
 		}
 		obj := *selectedObj
@@ -633,14 +693,14 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 					return
 				}
 				revealInExplorer(savePath)
-				dialog.ShowInformation("完成", "下载成功", w)
+				showInfo("完成", "下载成功", w)
 			})
 		}()
 	})
 
 	deleteBtn := widget.NewButtonWithIcon("删除文件", theme.DeleteIcon(), func() {
 		if selectedObj == nil {
-			dialog.ShowInformation("提示", "请先选择一个对象", w)
+			showInfo("提示", "请先选择一个对象", w)
 			return
 		}
 		obj := *selectedObj
@@ -672,7 +732,7 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 
 	urlBtn := widget.NewButtonWithIcon("Web URL", theme.ContentCopyIcon(), func() {
 		if selectedObj == nil || selectedObj.IsDir {
-			dialog.ShowInformation("提示", "请先选择一个文件", w)
+			showInfo("提示", "请先选择一个文件", w)
 			return
 		}
 		obj := *selectedObj
@@ -816,7 +876,7 @@ func editAccount(w fyne.Window, s *store.Store, acc *model.Account, onDone func(
 			return
 		}
 		if name.Text == "" || accessKey.Text == "" {
-			dialog.ShowInformation("提示", "名称和 Access Key ID 不能为空", w)
+			showInfo("提示", "名称和 Access Key ID 不能为空", w)
 			return
 		}
 		a := &model.Account{
