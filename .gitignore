@@ -1,3 +1,4 @@
 *.exe
 TODO.md
 build.log
+_cgodiag/

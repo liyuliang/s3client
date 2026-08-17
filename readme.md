@@ -50,25 +50,48 @@ internal/
 
 ## 构建与运行
 
-### GUI（需要 CGO + C 编译器）
+项目支持 **Windows / macOS / Linux** 三平台。推荐用 `make`（在各自系统上原生构建）：
 
 ```bash
-go mod tidy
-go build -ldflags "-H windowsgui" -o s3client.exe .
-./s3client.exe
+make build       # 为当前系统构建 GUI（Windows 自动隐藏控制台并链接 exe 图标）
+make build-cli   # 构建纯 Go CLI（跨平台，无需 CGO）
+make run         # 直接运行 GUI
 ```
 
-> Fyne 依赖 CGO，需要可用的 C 编译器（如 MinGW-w64 的 gcc 13/14）。
+> GUI 依赖 **CGO**（Fyne 需要各平台的 C 工具链和图形库），需在**目标系统上原生构建**；CLI 是纯 Go，任意平台可交叉编译。
 
-### CLI（纯 Go，无需 CGO）
+### 各平台构建依赖
+
+| 平台 | 构建依赖 | 运行依赖 |
+|------|----------|----------|
+| **Windows** | MinGW-w64 的 `gcc`（如 MSYS2 ucrt64）；构建前 `export PATH=/c/msys64/ucrt64/bin/:$PATH` | 无 |
+| **macOS** | Xcode Command Line Tools（`xcode-select --install`） | 无 |
+| **Linux** | `gcc` + 图形开发库：`libgl1-mesa-dev`、`xorg-dev`（Debian/Ubuntu）或对应包 | **`zenity`**（文件对话框需要，`apt/dnf install zenity`） |
+
+### 手动构建（不使用 make）
 
 ```bash
-CGO_ENABLED=0 go build -o s3cli.exe ./cmd/cli
-./s3cli.exe
-```
+# GUI —— Windows
+export PATH=/c/msys64/ucrt64/bin/:$PATH
+goversioninfo -64 -o resource_windows.syso   # 生成 exe 图标（仅 Windows；必须 -64）
+CGO_ENABLED=1 go build -ldflags "-H windowsgui" -o s3client.exe .
 
+# GUI —— macOS / Linux（不要加 -H windowsgui）
+CGO_ENABLED=1 go build -o s3client .
+
+# CLI —— 任意平台
+CGO_ENABLED=0 go build -o s3cli ./cmd/cli
+```
 
 CLI 命令：`list` | `add` | `del <id>` | `test <id>` | `buckets <id>` | `help` | `exit`
+
+### 跨平台打包与图标
+
+- Windows 的 exe 图标由 `resource_windows.syso`（`goversioninfo -64` 生成，含 GOOS 后缀，仅 Windows 参与链接）提供。
+- 各平台带图标的应用打包推荐 [`fyne`](https://docs.fyne.io/) CLI：准备一张 `Icon.png` 后 `make package-mac` / `package-linux` / `package-windows`（配置见 `fyneapp.toml`）。
+- 从**单台机器交叉构建**其它系统的 GUI 二进制，推荐 [`fyne-cross`](https://github.com/fyne-io/fyne-cross)（基于 Docker，自带各平台交叉工具链）。
+
+> 说明：核心逻辑、CLI 及纯 Go 包已验证可交叉编译到 macOS / Linux；GUI（CGO）需在目标系统或用 fyne-cross 构建，尚未在 Mac/Linux 实机验证。
 
 ## 安全设计
 
