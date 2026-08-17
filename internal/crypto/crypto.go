@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/scrypt"
 )
 
@@ -15,13 +16,27 @@ const (
 	saltLen  = 32
 	keyLen   = 32
 	nonceLen = 12
-	// scrypt 参数
+	// scrypt 参数（内部账号密钥派生）
 	scryptN = 32768
 	scryptR = 8
 	scryptP = 1
+	// Argon2id 参数（导出文件密钥派生，企业级）：m=64MiB, t=3, p=4
+	Argon2Time    = 3
+	Argon2Memory  = 64 * 1024 // KiB
+	Argon2Threads = 4
 	// 用于验证主密码的已知明文
 	verifierPlain = "s3client-master-password-verifier"
 )
+
+// DeriveKeyArgon2 使用默认企业级参数从主密码派生 32 字节密钥（用于导出文件加密）。
+func DeriveKeyArgon2(password string, salt []byte) []byte {
+	return DeriveKeyArgon2Params(password, salt, Argon2Time, Argon2Memory, Argon2Threads)
+}
+
+// DeriveKeyArgon2Params 用指定的 Argon2id 参数派生密钥（导入时用导出文件里记录的参数，向前兼容）。
+func DeriveKeyArgon2Params(password string, salt []byte, time, memory uint32, threads uint8) []byte {
+	return argon2.IDKey([]byte(password), salt, time, memory, threads, keyLen)
+}
 
 func GenerateSalt() ([]byte, error) {
 	salt := make([]byte, saltLen)

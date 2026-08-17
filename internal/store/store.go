@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -323,6 +324,135 @@ func (s *Store) ChangeMasterPassword(newPassword string) error {
 	}
 	s.key = newKey
 	return nil
+}
+
+// VerifyMasterPassword 校验主密码是否正确（用库内的 salt 与 verifier 比对）。
+func (s *Store) VerifyMasterPassword(password string) (bool, error) {
+	var saltB64, verifier string
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key='salt'`).Scan(&saltB64); err != nil {
+		return false, err
+	}
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key='verifier'`).Scan(&verifier); err != nil {
+		return false, err
+	}
+	salt, err := decodeBytes(saltB64)
+	if err != nil {
+		return false, err
+	}
+	key, err := crypto.DeriveKey(password, salt)
+	if err != nil {
+		return false, err
+	}
+	return crypto.CheckVerifier(key, verifier), nil
+}
+
+// exportAccount 是导出文件里单个账号的明文表示（整个文件会被加密）。
+type exportAccount struct {
+	Name            string `json:"name"`
+	Endpoint        string `json:"endpoint"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+	UsePathStyle    bool   `json:"use_path_style"`
+}
+
+// exportFile 是自包含的加密导出文件格式：记录 KDF 参数、salt 与 AES-256-GCM 载荷。
+type exportFile struct {
+	Version      int    `json:"version"`
+	KDF          string `json:"kdf"`
+	ArgonTime    uint32 `json:"argon_time"`
+	ArgonMemory  uint32 `json:"argon_memory"`
+	ArgonThreads uint8  `json:"argon_threads"`
+	Salt         string `json:"salt"`    // base64
+	Payload      string `json:"payload"` // AES-256-GCM(base64(nonce||cipher||tag))
+}
+
+// ExportAccounts 用主密码经 Argon2id 派生密钥、AES-256-GCM 加密所有账号，返回自包含的导出文件字节。
+func (s *Store) ExportAccounts(password string) ([]byte, error) {
+	ok, err := s.VerifyMasterPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("主密码错误")
+	}
+	accounts, err := s.ListAccounts()
+	if err != nil {
+		return nil, err
+	}
+	dtos := make([]exportAccount, 0, len(accounts))
+	for _, a := range accounts {
+		dtos = append(dtos, exportAccount{
+			Name:            a.Name,
+			Endpoint:        a.Endpoint,
+			Region:          a.Region,
+			AccessKeyID:     a.AccessKeyID,
+			SecretAccessKey: a.SecretAccessKey,
+			UsePathStyle:    a.UsePathStyle,
+		})
+	}
+	plain, err := json.Marshal(dtos)
+	if err != nil {
+		return nil, err
+	}
+	salt, err := crypto.GenerateSalt()
+	if err != nil {
+		return nil, err
+	}
+	key := crypto.DeriveKeyArgon2(password, salt)
+	payload, err := crypto.Encrypt(key, plain)
+	if err != nil {
+		return nil, err
+	}
+	ef := exportFile{
+		Version:      1,
+		KDF:          "argon2id",
+		ArgonTime:    crypto.Argon2Time,
+		ArgonMemory:  crypto.Argon2Memory,
+		ArgonThreads: crypto.Argon2Threads,
+		Salt:         crypto.EncodeBase64(salt),
+		Payload:      payload,
+	}
+	return json.MarshalIndent(ef, "", "  ")
+}
+
+// ImportAccounts 用主密码解密导出文件（AES-GCM 认证失败即密码错误或文件损坏），
+// 把其中的账号用当前库的密钥重新加密入库，返回导入数量。
+func (s *Store) ImportAccounts(password string, data []byte) (int, error) {
+	var ef exportFile
+	if err := json.Unmarshal(data, &ef); err != nil {
+		return 0, errors.New("文件格式无效")
+	}
+	salt, err := crypto.DecodeBase64(ef.Salt)
+	if err != nil {
+		return 0, errors.New("文件格式无效")
+	}
+	key := crypto.DeriveKeyArgon2Params(password, salt, ef.ArgonTime, ef.ArgonMemory, ef.ArgonThreads)
+	plain, err := crypto.Decrypt(key, ef.Payload)
+	if err != nil {
+		return 0, errors.New("主密码错误或文件已损坏")
+	}
+	var dtos []exportAccount
+	if err := json.Unmarshal(plain, &dtos); err != nil {
+		return 0, errors.New("文件内容无效")
+	}
+	count := 0
+	for i := range dtos {
+		d := dtos[i]
+		a := &model.Account{
+			Name:            d.Name,
+			Endpoint:        d.Endpoint,
+			Region:          d.Region,
+			AccessKeyID:     d.AccessKeyID,
+			SecretAccessKey: d.SecretAccessKey,
+			UsePathStyle:    d.UsePathStyle,
+		}
+		if err := s.AddAccount(a); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
 }
 
 func boolToInt(b bool) int {

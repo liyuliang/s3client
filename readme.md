@@ -1,6 +1,6 @@
 # S3 Client
 
-一个 Windows 桌面端 AWS S3 客户端，支持 S3 兼容存储（如 MinIO）。使用 Go + Fyne 构建，提供 GUI 和 CLI 两种入口。
+一个 桌面端 AWS S3 客户端，支持 S3 兼容存储（如 MinIO）。使用 Go + Fyne 构建，提供 GUI 和 CLI 两种入口。
 
 ## 功能
 

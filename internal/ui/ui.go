@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"fmt"
 	"image/color"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -51,9 +52,9 @@ func (appTheme) Color(n fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
 	return theme.DefaultTheme().Color(n, theme.VariantDark)
 }
 
-func (appTheme) Font(s fyne.TextStyle) fyne.Resource  { return theme.DefaultTheme().Font(s) }
+func (appTheme) Font(s fyne.TextStyle) fyne.Resource     { return theme.DefaultTheme().Font(s) }
 func (appTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return theme.DefaultTheme().Icon(n) }
-func (appTheme) Size(n fyne.ThemeSizeName) float32   { return theme.DefaultTheme().Size(n) }
+func (appTheme) Size(n fyne.ThemeSizeName) float32       { return theme.DefaultTheme().Size(n) }
 
 // revealInExplorer 在系统文件管理器中打开并选中指定文件。
 func revealInExplorer(path string) {
@@ -275,6 +276,20 @@ func (rr *tappableRowRenderer) Refresh() {
 	rr.bg.Refresh()
 }
 
+// askPassword 弹出一个输入主密码的对话框（约 360px 宽），确定且非空时回调。
+func askPassword(w fyne.Window, title string, onOK func(pw string)) {
+	pw := widget.NewPasswordEntry()
+	pw.SetPlaceHolder("主密码")
+	content := container.NewVScroll(pw)
+	content.SetMinSize(fyne.NewSize(360, 60))
+	dialog.ShowCustomConfirm(title, "确定", "取消", content, func(ok bool) {
+		if !ok || pw.Text == "" {
+			return
+		}
+		onOK(pw.Text)
+	}, w)
+}
+
 // showInfo 显示一个约 300px 宽的信息对话框（参数顺序与 dialog.ShowInformation 一致）。
 func showInfo(title, message string, w fyne.Window) {
 	lbl := widget.NewLabel(message)
@@ -458,7 +473,62 @@ func showMain(w fyne.Window, s *store.Store) {
 			showInfo("完成", "主密码已更新", w)
 		}, w)
 	})
-	menu := fyne.NewMenu("菜单", lockItem, changePwItem, locItem)
+	exportItem := fyne.NewMenuItem("导出账号...", func() {
+		askPassword(w, "导出账号 — 输入主密码", func(pw string) {
+			go func() {
+				data, err := s.ExportAccounts(pw)
+				if err != nil {
+					fyne.Do(func() { dialog.ShowError(err, w) })
+					return
+				}
+				savePath, zerr := zenity.SelectFileSave(
+					zenity.Title("保存加密的账号导出文件"),
+					zenity.Filename("s3client-accounts.enc"),
+					zenity.ConfirmOverwrite(),
+				)
+				if zerr != nil {
+					return
+				}
+				werr := os.WriteFile(savePath, data, 0600)
+				fyne.Do(func() {
+					if werr != nil {
+						dialog.ShowError(werr, w)
+						return
+					}
+					showInfo("完成", "账号已加密导出", w)
+				})
+			}()
+		})
+	})
+	importItem := fyne.NewMenuItem("导入账号...", func() {
+		go func() {
+			path, zerr := zenity.SelectFile(zenity.Title("选择账号导出文件"))
+			if zerr != nil {
+				return
+			}
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				fyne.Do(func() { dialog.ShowError(rerr, w) })
+				return
+			}
+			fyne.Do(func() {
+				askPassword(w, "导入账号 — 输入主密码", func(pw string) {
+					go func() {
+						n, ierr := s.ImportAccounts(pw, data)
+						fyne.Do(func() {
+							if ierr != nil {
+								dialog.ShowError(ierr, w)
+								return
+							}
+							reload()
+							showInfo("完成", fmt.Sprintf("成功导入 %d 个账号", n), w)
+						})
+					}()
+				})
+			})
+		}()
+	})
+	menu := fyne.NewMenu("菜单", lockItem, changePwItem, exportItem, importItem, locItem)
 	w.SetMainMenu(fyne.NewMainMenu(menu))
 
 	split := container.NewHSplit(leftPanel, rightPanel)
