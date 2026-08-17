@@ -19,7 +19,8 @@
 - **下载后打开文件夹**：下载完成自动在系统文件管理器中打开并选中文件
 - **Bucket 权限检查**：双击账号后用 HeadBucket 检查每个 Bucket 的访问权限，固定列显示 可访问/无权限；可访问的桶名显示绿色可双击进入，无权限的显示灰色且禁止双击
 - **右键查看属性**：Bucket/文件夹/文件均可右键查看属性，属性值可 Ctrl+C 复制
-- **菜单栏**：解锁后提供「加锁」「修改主密码」「修改 SQLite 存储位置」（修改主密码会重新派生密钥并重加密所有账号，事务保证原子性）
+- **菜单栏**：解锁后提供「加锁」「修改主密码」「导出账号」「导入账号」「修改 SQLite 存储位置」（修改主密码会重新派生密钥并重加密所有账号，事务保证原子性）
+- **加密导出/导入账号**：用主密码经 **Argon2id**（m=64MiB, t=3, p=4）派生密钥、**AES-256-GCM** 加密所有账号到自包含文件；导入时用错主密码或文件被篡改会解密失败（GCM 认证天然实现主密码验证），可跨机器迁移账号
 - **错误消息区**：进入无权限 Bucket 时在底部可滚动消息区显示错误，并保留返回按钮
 - **预签名 URL**：为文件生成预签名 GET URL，过期时间可自定义（默认 10 分钟）
 - **测试连接**：一键验证账号凭证是否有效
@@ -32,7 +33,7 @@
 | GUI | [Fyne v2](https://fyne.io/) |
 | S3 | [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2) |
 | 数据库 | [modernc.org/sqlite](https://modernc.org/sqlite)（纯 Go，无需 CGO） |
-| 加密 | AES-256-GCM + [scrypt](https://pkg.go.dev/golang.org/x/crypto/scrypt) 密钥派生 |
+| 加密 | AES-256-GCM + [scrypt](https://pkg.go.dev/golang.org/x/crypto/scrypt)（内部）/ [Argon2id](https://pkg.go.dev/golang.org/x/crypto/argon2)（导出文件）密钥派生 |
 | CLI 密码输入 | [golang.org/x/term](https://pkg.go.dev/golang.org/x/term) |
 
 ## 目录结构
@@ -100,3 +101,4 @@ CLI 命令：`list` | `add` | `del <id>` | `test <id>` | `buckets <id>` | `help`
 - 每次加密使用随机 12 字节 nonce + AES-256-GCM
 - 主密码本身不落库，仅存加密校验器用于解锁验证
 - 数据库文件位于 `~/.s3client/data.db`，权限 0700
+- **账号导出文件**：用主密码经 Argon2id（m=64MiB, t=3, p=4）派生独立密钥，AES-256-GCM 加密；文件自包含（版本 + KDF 参数 + 随机 salt + 密文），每次导出用新随机 salt/nonce；导入时 GCM 认证失败即判定主密码错误或文件损坏，导出文件以 0600 权限写入
