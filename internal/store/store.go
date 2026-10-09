@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -144,6 +145,15 @@ func openDB() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	for _, stmt := range []string{
+		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 's3'`,
+		`ALTER TABLE accounts ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN client_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN client_secret TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN site_url TEXT NOT NULL DEFAULT ''`,
+	} {
+		db.Exec(stmt)
+	}
 	return db, nil
 }
 
@@ -225,13 +235,25 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) AddAccount(a *model.Account) error {
+	provider := a.Provider
+	if provider == "" {
+		provider = "s3"
+	}
 	enc, err := crypto.Encrypt(s.key, []byte(a.SecretAccessKey))
 	if err != nil {
 		return err
 	}
+	var encCS string
+	if a.ClientSecret != "" {
+		encCS, err = crypto.Encrypt(s.key, []byte(a.ClientSecret))
+		if err != nil {
+			return err
+		}
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO accounts (name, endpoint, region, access_key_id, secret_access_key, use_path_style) VALUES (?,?,?,?,?,?)`,
-		a.Name, a.Endpoint, a.Region, a.AccessKeyID, enc, boolToInt(a.UsePathStyle),
+		`INSERT INTO accounts (name, provider, endpoint, region, access_key_id, secret_access_key, use_path_style, tenant_id, client_id, client_secret, site_url) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		a.Name, provider, a.Endpoint, a.Region, a.AccessKeyID, enc, boolToInt(a.UsePathStyle),
+		a.TenantID, a.ClientID, encCS, a.SiteURL,
 	)
 	if err != nil {
 		return err
@@ -242,7 +264,7 @@ func (s *Store) AddAccount(a *model.Account) error {
 }
 
 func (s *Store) ListAccounts() ([]model.Account, error) {
-	rows, err := s.db.Query(`SELECT id, name, endpoint, region, access_key_id, secret_access_key, use_path_style FROM accounts ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, name, provider, endpoint, region, access_key_id, secret_access_key, use_path_style, tenant_id, client_id, client_secret, site_url FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -251,15 +273,25 @@ func (s *Store) ListAccounts() ([]model.Account, error) {
 	for rows.Next() {
 		var a model.Account
 		var pathStyle int
-		if err := rows.Scan(&a.ID, &a.Name, &a.Endpoint, &a.Region, &a.AccessKeyID, &a.SecretAccessKey, &pathStyle); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Provider, &a.Endpoint, &a.Region, &a.AccessKeyID, &a.SecretAccessKey, &pathStyle, &a.TenantID, &a.ClientID, &a.ClientSecret, &a.SiteURL); err != nil {
 			return nil, err
 		}
 		a.UsePathStyle = pathStyle != 0
+		if a.Provider == "" {
+			a.Provider = "s3"
+		}
 		plain, err := crypto.Decrypt(s.key, a.SecretAccessKey)
 		if err != nil {
 			return nil, err
 		}
 		a.SecretAccessKey = string(plain)
+		if a.ClientSecret != "" {
+			plainCS, err := crypto.Decrypt(s.key, a.ClientSecret)
+			if err != nil {
+				return nil, err
+			}
+			a.ClientSecret = string(plainCS)
+		}
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
@@ -271,13 +303,25 @@ func (s *Store) DeleteAccount(id int64) error {
 }
 
 func (s *Store) UpdateAccount(a *model.Account) error {
+	provider := a.Provider
+	if provider == "" {
+		provider = "s3"
+	}
 	enc, err := crypto.Encrypt(s.key, []byte(a.SecretAccessKey))
 	if err != nil {
 		return err
 	}
+	var encCS string
+	if a.ClientSecret != "" {
+		encCS, err = crypto.Encrypt(s.key, []byte(a.ClientSecret))
+		if err != nil {
+			return err
+		}
+	}
 	_, err = s.db.Exec(
-		`UPDATE accounts SET name=?, endpoint=?, region=?, access_key_id=?, secret_access_key=?, use_path_style=? WHERE id=?`,
-		a.Name, a.Endpoint, a.Region, a.AccessKeyID, enc, boolToInt(a.UsePathStyle), a.ID,
+		`UPDATE accounts SET name=?, provider=?, endpoint=?, region=?, access_key_id=?, secret_access_key=?, use_path_style=?, tenant_id=?, client_id=?, client_secret=?, site_url=? WHERE id=?`,
+		a.Name, provider, a.Endpoint, a.Region, a.AccessKeyID, enc, boolToInt(a.UsePathStyle),
+		a.TenantID, a.ClientID, encCS, a.SiteURL, a.ID,
 	)
 	return err
 }
@@ -314,7 +358,15 @@ func (s *Store) ChangeMasterPassword(newPassword string) error {
 			tx.Rollback()
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE accounts SET secret_access_key=? WHERE id=?`, enc, a.ID); err != nil {
+		var encCS string
+		if a.ClientSecret != "" {
+			encCS, err = crypto.Encrypt(newKey, []byte(a.ClientSecret))
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET secret_access_key=?, client_secret=? WHERE id=?`, enc, encCS, a.ID); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -346,14 +398,43 @@ func (s *Store) VerifyMasterPassword(password string) (bool, error) {
 	return crypto.CheckVerifier(key, verifier), nil
 }
 
+// bucketPrefixKey 构造 meta 表里记录某账号某 bucket 上次打开目录的键。
+func bucketPrefixKey(accountID int64, bucket string) string {
+	return fmt.Sprintf("bucketpfx:%d:%s", accountID, bucket)
+}
+
+// GetBucketPrefix 返回某账号某 bucket 上次打开的目录前缀；未记录过则返回空串（根目录），不视为错误。
+func (s *Store) GetBucketPrefix(accountID int64, bucket string) (string, error) {
+	var prefix string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key=?`, bucketPrefixKey(accountID, bucket)).Scan(&prefix)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return prefix, nil
+}
+
+// SetBucketPrefix 记录某账号某 bucket 当前打开的目录前缀（prefix 为明文路径，不含密钥，无需加密）。
+func (s *Store) SetBucketPrefix(accountID int64, bucket, prefix string) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, bucketPrefixKey(accountID, bucket), prefix)
+	return err
+}
+
 // exportAccount 是导出文件里单个账号的明文表示（整个文件会被加密）。
 type exportAccount struct {
 	Name            string `json:"name"`
+	Provider        string `json:"provider,omitempty"`
 	Endpoint        string `json:"endpoint"`
 	Region          string `json:"region"`
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
 	UsePathStyle    bool   `json:"use_path_style"`
+	TenantID        string `json:"tenant_id,omitempty"`
+	ClientID        string `json:"client_id,omitempty"`
+	ClientSecret    string `json:"client_secret,omitempty"`
+	SiteURL         string `json:"site_url,omitempty"`
 }
 
 // exportFile 是自包含的加密导出文件格式：记录 KDF 参数、salt 与 AES-256-GCM 载荷。
@@ -384,11 +465,16 @@ func (s *Store) ExportAccounts(password string) ([]byte, error) {
 	for _, a := range accounts {
 		dtos = append(dtos, exportAccount{
 			Name:            a.Name,
+			Provider:        a.Provider,
 			Endpoint:        a.Endpoint,
 			Region:          a.Region,
 			AccessKeyID:     a.AccessKeyID,
 			SecretAccessKey: a.SecretAccessKey,
 			UsePathStyle:    a.UsePathStyle,
+			TenantID:        a.TenantID,
+			ClientID:        a.ClientID,
+			ClientSecret:    a.ClientSecret,
+			SiteURL:         a.SiteURL,
 		})
 	}
 	plain, err := json.Marshal(dtos)
@@ -439,13 +525,22 @@ func (s *Store) ImportAccounts(password string, data []byte) (int, error) {
 	count := 0
 	for i := range dtos {
 		d := dtos[i]
+		provider := d.Provider
+		if provider == "" {
+			provider = "s3"
+		}
 		a := &model.Account{
 			Name:            d.Name,
+			Provider:        provider,
 			Endpoint:        d.Endpoint,
 			Region:          d.Region,
 			AccessKeyID:     d.AccessKeyID,
 			SecretAccessKey: d.SecretAccessKey,
 			UsePathStyle:    d.UsePathStyle,
+			TenantID:        d.TenantID,
+			ClientID:        d.ClientID,
+			ClientSecret:    d.ClientSecret,
+			SiteURL:         d.SiteURL,
 		}
 		if err := s.AddAccount(a); err != nil {
 			return count, err

@@ -4,11 +4,13 @@ import (
 	_ "embed"
 	"fmt"
 	"image/color"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -23,6 +25,7 @@ import (
 
 	"s3client/internal/awss3"
 	"s3client/internal/model"
+	"s3client/internal/sharepoint"
 	"s3client/internal/store"
 )
 
@@ -164,13 +167,21 @@ type tappableRow struct {
 	icon         fyne.Resource
 	selected     bool
 	nameColor    color.Color
-	onTapped     func()
-	onDoubleTap  func()
-	secondaryTap func()
+	check         *widget.Check
+	onTapped      func()
+	onDoubleTap   func()
+	secondaryTap  func()
+	secondaryMenu []*fyne.MenuItem
 }
 
 func (r *tappableRow) withSecondary(fn func()) *tappableRow {
 	r.secondaryTap = fn
+	return r
+}
+
+// withSecondaryMenu 给行加一个右键上下文菜单，右键时在点击位置弹出。
+func (r *tappableRow) withSecondaryMenu(items ...*fyne.MenuItem) *tappableRow {
+	r.secondaryMenu = items
 	return r
 }
 
@@ -179,7 +190,20 @@ func (r *tappableRow) withColor(c color.Color) *tappableRow {
 	return r
 }
 
-func (r *tappableRow) TappedSecondary(_ *fyne.PointEvent) {
+// withCheck 给行左侧加一个复选框（用于多选下载），勾选状态变化时回调。
+// 加了复选框后，单击行（除复选框本身以外的位置）会切换勾选状态。
+func (r *tappableRow) withCheck(onChanged func(bool)) *tappableRow {
+	r.check = widget.NewCheck("", onChanged)
+	return r
+}
+
+func (r *tappableRow) TappedSecondary(e *fyne.PointEvent) {
+	if len(r.secondaryMenu) > 0 {
+		if c := fyne.CurrentApp().Driver().CanvasForObject(r); c != nil {
+			widget.ShowPopUpMenuAtPosition(fyne.NewMenu("", r.secondaryMenu...), c, e.AbsolutePosition)
+		}
+		return
+	}
 	if r.secondaryTap != nil {
 		r.secondaryTap()
 	}
@@ -200,6 +224,9 @@ func newTappableRowDetail(text string, meta []string, icon fyne.Resource, onTapp
 func (r *tappableRow) Tapped(_ *fyne.PointEvent) {
 	if r.onTapped != nil {
 		r.onTapped()
+	}
+	if r.check != nil {
+		r.check.SetChecked(!r.check.Checked)
 	}
 }
 
@@ -233,7 +260,12 @@ func (r *tappableRow) CreateRenderer() fyne.WidgetRenderer {
 		setText = func(s string) { l.SetText(s) }
 	}
 
-	left := container.NewHBox(icon, nameObj)
+	var left *fyne.Container
+	if r.check != nil {
+		left = container.NewHBox(r.check, icon, nameObj)
+	} else {
+		left = container.NewHBox(icon, nameObj)
+	}
 	var content *fyne.Container
 	if cols := newMetaCols(r.meta, false); cols != nil {
 		content = container.NewBorder(nil, nil, left, cols)
@@ -337,6 +369,7 @@ func showMain(w fyne.Window, s *store.Store) {
 	}
 
 	var reload func()
+	var doEdit, doDelete, doTest func(acc model.Account)
 	reload = func() {
 		var err error
 		accounts, err = s.ListAccounts()
@@ -351,7 +384,18 @@ func showMain(w fyne.Window, s *store.Store) {
 			acc := accounts[i]
 			row := newTappableRow(acc.Name, theme.AccountIcon(),
 				func() { selectRow(idx) },
-				func() { selectRow(idx); showBuckets(w, setRight, &acc) },
+				func() {
+				selectRow(idx)
+				if acc.IsSharePoint() {
+					showSharePointDrives(w, setRight, s, &acc)
+				} else {
+					showBuckets(w, setRight, s, &acc)
+				}
+			},
+			).withSecondaryMenu(
+				fyne.NewMenuItem("编辑账号...", func() { selectRow(idx); doEdit(acc) }),
+				fyne.NewMenuItem("删除账号", func() { selectRow(idx); doDelete(acc) }),
+				fyne.NewMenuItem("测试连接", func() { selectRow(idx); doTest(acc) }),
 			)
 			rows = append(rows, row)
 			accountList.Add(row)
@@ -361,23 +405,10 @@ func showMain(w fyne.Window, s *store.Store) {
 	}
 	reload()
 
-	addBtn := widget.NewButtonWithIcon("新增", theme.ContentAddIcon(), func() {
-		editAccount(w, s, nil, reload)
-	})
-	editBtn := widget.NewButtonWithIcon("编辑", theme.DocumentCreateIcon(), func() {
-		if selected < 0 || selected >= len(accounts) {
-			showInfo("提示", "请先选择一个账号", w)
-			return
-		}
-		acc := accounts[selected]
+	doEdit = func(acc model.Account) {
 		editAccount(w, s, &acc, reload)
-	})
-	delBtn := widget.NewButtonWithIcon("删除", theme.DeleteIcon(), func() {
-		if selected < 0 || selected >= len(accounts) {
-			showInfo("提示", "请先选择一个账号", w)
-			return
-		}
-		acc := accounts[selected]
+	}
+	doDelete = func(acc model.Account) {
 		dialog.ShowConfirm("确认删除", fmt.Sprintf("确定删除账号 %q 吗？", acc.Name), func(ok bool) {
 			if !ok {
 				return
@@ -388,30 +419,38 @@ func showMain(w fyne.Window, s *store.Store) {
 			}
 			reload()
 		}, w)
-	})
-	testBtn := widget.NewButton("测试连接", func() {
-		if selected < 0 || selected >= len(accounts) {
-			showInfo("提示", "请先选择一个账号", w)
-			return
-		}
-		acc := accounts[selected]
+	}
+	doTest = func(acc model.Account) {
 		prog := dialog.NewCustomWithoutButtons("测试中", widget.NewLabel("正在连接..."), w)
 		prog.Show()
 		go func() {
-			buckets, err := awss3.ListBuckets(&acc)
-			fyne.Do(func() {
-				prog.Hide()
-				if err != nil {
-					dialog.ShowError(fmt.Errorf("连接失败: %w", err), w)
-					return
-				}
-				showInfo("连接成功", fmt.Sprintf("发现 %d 个桶", len(buckets)), w)
-			})
+			if acc.IsSharePoint() {
+				cfg := spConfig(&acc)
+				err := sharepoint.TestConnection(cfg)
+				fyne.Do(func() {
+					prog.Hide()
+					if err != nil {
+						dialog.ShowError(fmt.Errorf("连接失败: %w", err), w)
+						return
+					}
+					showInfo("连接成功", "SharePoint 站点连接正常", w)
+				})
+			} else {
+				buckets, err := awss3.ListBuckets(&acc)
+				fyne.Do(func() {
+					prog.Hide()
+					if err != nil {
+						dialog.ShowError(fmt.Errorf("连接失败: %w", err), w)
+						return
+					}
+					showInfo("连接成功", fmt.Sprintf("发现 %d 个桶", len(buckets)), w)
+				})
+			}
 		}()
-	})
+	}
 
-	toolbar := container.NewGridWithColumns(2, addBtn, editBtn, delBtn, testBtn)
-	leftPanel := container.NewBorder(toolbar, nil, nil, nil, accountScroll)
+	panelTitle := widget.NewLabelWithStyle("账号（右键可编辑/删除/测试）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	leftPanel := container.NewBorder(panelTitle, nil, nil, nil, accountScroll)
 
 	lockItem := fyne.NewMenuItem("加锁", func() {
 		s.Close()
@@ -528,8 +567,34 @@ func showMain(w fyne.Window, s *store.Store) {
 			})
 		}()
 	})
-	menu := fyne.NewMenu("菜单", lockItem, changePwItem, exportItem, importItem, locItem)
-	w.SetMainMenu(fyne.NewMainMenu(menu))
+	selectedAcc := func() (model.Account, bool) {
+		if selected < 0 || selected >= len(accounts) {
+			showInfo("提示", "请先选择一个账号", w)
+			return model.Account{}, false
+		}
+		return accounts[selected], true
+	}
+	addItem := fyne.NewMenuItem("新增账号...", func() { editAccount(w, s, nil, reload) })
+	editItem := fyne.NewMenuItem("编辑账号...", func() {
+		if acc, ok := selectedAcc(); ok {
+			doEdit(acc)
+		}
+	})
+	delItem := fyne.NewMenuItem("删除账号", func() {
+		if acc, ok := selectedAcc(); ok {
+			doDelete(acc)
+		}
+	})
+	testItem := fyne.NewMenuItem("测试连接", func() {
+		if acc, ok := selectedAcc(); ok {
+			doTest(acc)
+		}
+	})
+	accountMenu := fyne.NewMenu("账号", addItem, editItem, delItem, testItem,
+		fyne.NewMenuItemSeparator(), exportItem, importItem)
+	securityMenu := fyne.NewMenu("安全", lockItem, changePwItem)
+	storageMenu := fyne.NewMenu("存储", locItem)
+	w.SetMainMenu(fyne.NewMainMenu(accountMenu, securityMenu, storageMenu))
 
 	split := container.NewHSplit(leftPanel, rightPanel)
 	split.Offset = 0.3
@@ -537,7 +602,7 @@ func showMain(w fyne.Window, s *store.Store) {
 }
 
 // showBuckets 在右侧面板显示某账号下的 Bucket 列表。
-func showBuckets(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Account) {
+func showBuckets(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account) {
 	loading := widget.NewLabel(fmt.Sprintf("正在加载 %s 的 Bucket...", acc.Name))
 	setRight(loading)
 
@@ -556,7 +621,10 @@ func showBuckets(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Acc
 				var onOpen func()
 				rowColor := color.Color(color.NRGBA{R: 0x2e, G: 0xa0, B: 0x43, A: 0xff}) // 绿：可访问
 				if b.Accessible {
-					onOpen = func() { showObjects(w, setRight, acc, b.Name, "") }
+					onOpen = func() {
+						pfx, _ := s.GetBucketPrefix(acc.ID, b.Name)
+						showObjects(w, setRight, s, acc, b.Name, pfx)
+					}
 				} else {
 					status = "✗ 无权限"
 					accessPlain = "无权限"
@@ -585,27 +653,30 @@ func showBuckets(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Acc
 }
 
 // showObjects 加载某 Bucket 内 prefix 层级的对象，然后构建带底部操作栏的视图。
-func showObjects(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Account, bucket, prefix string) {
+func showObjects(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, bucket, prefix string) {
 	loading := widget.NewLabel(fmt.Sprintf("正在加载 %s/%s ...", bucket, prefix))
 	setRight(loading)
 
 	go func() {
 		objects, err := awss3.ListObjects(acc, bucket, prefix)
+		if err == nil {
+			_ = s.SetBucketPrefix(acc.ID, bucket, prefix)
+		}
 		fyne.Do(func() {
 			errMsg := ""
 			if err != nil {
 				errMsg = err.Error()
 			}
-			buildObjectView(w, setRight, acc, bucket, prefix, objects, errMsg)
+			buildObjectView(w, setRight, s, acc, bucket, prefix, objects, errMsg)
 		})
 	}()
 }
 
 // buildBreadcrumb 构建可点击的面包屑路径栏：bucket / seg1 / seg2 / ...
-func buildBreadcrumb(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Account, bucket, prefix string) fyne.CanvasObject {
+func buildBreadcrumb(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, bucket, prefix string) fyne.CanvasObject {
 	crumbs := container.NewHBox()
 	bucketLink := widget.NewHyperlink(bucket, nil)
-	bucketLink.OnTapped = func() { showObjects(w, setRight, acc, bucket, "") }
+	bucketLink.OnTapped = func() { showObjects(w, setRight, s, acc, bucket, "") }
 	crumbs.Add(bucketLink)
 
 	if prefix != "" {
@@ -614,17 +685,178 @@ func buildBreadcrumb(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 			crumbs.Add(widget.NewLabel("/"))
 			seg := strings.Join(parts[:i+1], "/") + "/"
 			link := widget.NewHyperlink(part, nil)
-			link.OnTapped = func() { showObjects(w, setRight, acc, bucket, seg) }
+			link.OnTapped = func() { showObjects(w, setRight, s, acc, bucket, seg) }
 			crumbs.Add(link)
 		}
 	}
 	return crumbs
 }
 
+// transferTask 描述一个并行传输任务（上传或下载）。
+type transferTask struct {
+	name string
+	run  func(progress func(done, total int64)) error
+}
+
+// 传输进度行的尺寸：整行高度与底部细线高度。
+const (
+	transferRowH = 24
+	thinBarH     = 4
+)
+
+// transferRow 一个紧凑的传输进度行：上排文件名与百分比，底部一条细线进度条。
+type transferRow struct {
+	widget.BaseWidget
+	title string
+	name  *widget.Label
+	pct   *widget.Label
+	value float64
+	size  fyne.Size
+	bg    *canvas.Rectangle
+	fg    *canvas.Rectangle
+}
+
+func newTransferRow(title string) *transferRow {
+	r := &transferRow{title: title}
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *transferRow) CreateRenderer() fyne.WidgetRenderer {
+	r.name = widget.NewLabel(r.title)
+	r.name.Truncation = fyne.TextTruncateEllipsis
+	r.pct = widget.NewLabel("0%")
+	r.pct.Alignment = fyne.TextAlignTrailing
+	r.bg = canvas.NewRectangle(color.NRGBA{R: 0x33, G: 0x38, B: 0x44, A: 0xff})
+	r.fg = canvas.NewRectangle(theme.Color(theme.ColorNamePrimary))
+	return &transferRowRenderer{row: r}
+}
+
+// setValue 更新进度（0~1）与百分比文字。
+func (r *transferRow) setValue(v float64, pct string) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	r.value = v
+	if r.pct != nil {
+		r.pct.SetText(pct)
+	}
+	r.Refresh()
+}
+
+type transferRowRenderer struct {
+	row *transferRow
+}
+
+func (rr *transferRowRenderer) Destroy() {}
+
+func (rr *transferRowRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(120, transferRowH)
+}
+
+func (rr *transferRowRenderer) Layout(size fyne.Size) {
+	rr.row.size = size
+	pctW := float32(48)
+	topH := size.Height - thinBarH - 2
+	rr.row.pct.Resize(fyne.NewSize(pctW, topH))
+	rr.row.pct.Move(fyne.NewPos(size.Width-pctW, 0))
+	rr.row.name.Resize(fyne.NewSize(size.Width-pctW-4, topH))
+	rr.row.name.Move(fyne.NewPos(0, 0))
+	rr.row.bg.Resize(fyne.NewSize(size.Width, thinBarH))
+	rr.row.bg.Move(fyne.NewPos(0, size.Height-thinBarH))
+	rr.layoutBar()
+}
+
+func (rr *transferRowRenderer) layoutBar() {
+	w := rr.row.size.Width * float32(rr.row.value)
+	rr.row.fg.Resize(fyne.NewSize(w, thinBarH))
+	rr.row.fg.Move(fyne.NewPos(0, rr.row.size.Height-thinBarH))
+	rr.row.fg.Hidden = rr.row.value <= 0
+}
+
+func (rr *transferRowRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{rr.row.bg, rr.row.fg, rr.row.name, rr.row.pct}
+}
+
+func (rr *transferRowRenderer) Refresh() {
+	rr.layoutBar()
+	rr.row.bg.Refresh()
+	rr.row.fg.Refresh()
+}
+
+// runParallelTransfers 并行执行多个传输任务，在 progressArea 中显示每任务一条进度条，限流 maxConcurrent 并发。
+func runParallelTransfers(w fyne.Window, progressArea *fyne.Container, tasks []transferTask, onDone func()) {
+	if len(tasks) == 0 {
+		return
+	}
+	const maxConcurrent = 4
+	rows := make([]*transferRow, len(tasks))
+	progressArea.Objects = nil
+	for i, t := range tasks {
+		row := newTransferRow(t.name)
+		rows[i] = row
+		progressArea.Add(row)
+	}
+	progressArea.Refresh()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrent)
+	errs := make([]error, len(tasks))
+	for i := range tasks {
+		idx := i
+		t := tasks[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := t.run(func(done, total int64) {
+				if total > 0 {
+					ratio := float64(done) / float64(total)
+					fyne.Do(func() {
+						rows[idx].setValue(ratio, fmt.Sprintf("%d%%", int(ratio*100)))
+					})
+				}
+			})
+			errs[idx] = err
+			if err == nil {
+				fyne.Do(func() {
+					rows[idx].setValue(1, "100%")
+				})
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		fails := 0
+		for _, e := range errs {
+			if e != nil {
+				fails++
+			}
+		}
+		fyne.Do(func() {
+			progressArea.Objects = nil
+			progressArea.Refresh()
+			if onDone != nil {
+				onDone()
+			}
+			if fails > 0 {
+				showInfo("完成", fmt.Sprintf("%d 个任务完成，%d 个失败", len(tasks)-fails, fails), w)
+			} else {
+				showInfo("完成", fmt.Sprintf("全部 %d 个任务完成", len(tasks)), w)
+			}
+		})
+	}()
+}
+
 // buildObjectView 构建对象浏览器：面包屑 + 过滤框 + 文件/文件夹列表 + 底部操作栏 + 进度条。
-func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model.Account, bucket, prefix string, objects []awss3.Object, errMsg string) {
+func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, bucket, prefix string, objects []awss3.Object, errMsg string) {
 	var rows []*tappableRow
 	var selectedObj *awss3.Object
+	selectedKeys := map[string]*awss3.Object{}
 
 	selectRow := func(idx int, obj *awss3.Object) {
 		for i, r := range rows {
@@ -633,36 +865,51 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 		selectedObj = obj
 	}
 
-	refresh := func() { showObjects(w, setRight, acc, bucket, prefix) }
+	refresh := func() { showObjects(w, setRight, s, acc, bucket, prefix) }
 
 	list := container.NewVBox()
 
-	buildList := func(filter string) {
+	// 可过滤的行：名称预先转小写，过滤时只切换显隐，避免每次输入都重建整列表。
+	type filterRow struct {
+		row  *tappableRow
+		name string
+	}
+	var filterRows []filterRow
+
+	// applyFilter 按关键字显示/隐藏对象行。
+	applyFilter := func(lf string) {
+		for _, fr := range filterRows {
+			fr.row.Hidden = lf != "" && !strings.Contains(fr.name, lf)
+		}
+		list.Refresh()
+	}
+
+	buildList := func() {
 		rows = nil
 		list.Objects = nil
+		filterRows = nil
 		selectedObj = nil
+		for k := range selectedKeys {
+			delete(selectedKeys, k)
+		}
 
 		backBtn := newTappableRow("⬆ 返回上一级", theme.NavigateBackIcon(), nil, func() {
 			if prefix == "" {
-				showBuckets(w, setRight, acc)
+				showBuckets(w, setRight, s, acc)
 				return
 			}
-			showObjects(w, setRight, acc, bucket, parentPrefix(prefix))
+			showObjects(w, setRight, s, acc, bucket, parentPrefix(prefix))
 		})
 		rows = append(rows, backBtn)
 		list.Add(backBtn)
 
-		lf := strings.ToLower(filter)
 		for _, o := range objects {
 			obj := o
-			if lf != "" && !strings.Contains(strings.ToLower(obj.Name), lf) {
-				continue
-			}
 			idx := len(rows)
 			if obj.IsDir {
 				row := newTappableRowDetail(obj.Name, []string{"", "文件夹", ""}, theme.FolderIcon(),
 					func() { selectRow(idx, &obj) },
-					func() { showObjects(w, setRight, acc, bucket, obj.Key) },
+					func() { showObjects(w, setRight, s, acc, bucket, obj.Key) },
 				).withSecondary(func() {
 					showProperties(w, "文件夹属性", [][2]string{
 						{"名称", obj.Name},
@@ -671,6 +918,7 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 					})
 				})
 				rows = append(rows, row)
+				filterRows = append(filterRows, filterRow{row: row, name: strings.ToLower(obj.Name)})
 				list.Add(row)
 			} else {
 				meta := []string{
@@ -679,7 +927,9 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 					obj.LastModified.Local().Format("2006-01-02 15:04"),
 				}
 				row := newTappableRowDetail(obj.Name, meta, theme.FileIcon(),
-					func() { selectRow(idx, &obj) }, nil).withSecondary(func() {
+					func() {
+						selectRow(idx, &obj)
+					}, nil).withSecondary(func() {
 					showProperties(w, "文件属性", [][2]string{
 						{"名称", obj.Name},
 						{"Key", obj.Key},
@@ -687,83 +937,97 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 						{"类型", obj.Type},
 						{"最后修改", obj.LastModified.Local().Format("2006-01-02 15:04:05")},
 					})
+				}).withCheck(func(checked bool) {
+					if checked {
+						selectedKeys[obj.Key] = &obj
+					} else {
+						delete(selectedKeys, obj.Key)
+					}
+					selectRow(idx, &obj)
 				})
 				rows = append(rows, row)
+				filterRows = append(filterRows, filterRow{row: row, name: strings.ToLower(obj.Name)})
 				list.Add(row)
 			}
 		}
 		list.Refresh()
 	}
-	buildList("")
+	buildList()
 
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("输入关键字过滤...")
-	filterEntry.OnChanged = func(s string) { buildList(s) }
+	var filterTimer *time.Timer
+	filterEntry.OnChanged = func(text string) {
+		// 输入防抖：停止输入约 150ms 后才真正过滤，避免每个字符都重排整列表。
+		if filterTimer != nil {
+			filterTimer.Stop()
+		}
+		filterTimer = time.AfterFunc(150*time.Millisecond, func() {
+			fyne.Do(func() { applyFilter(strings.ToLower(text)) })
+		})
+	}
 
 	nameHeader := widget.NewLabelWithStyle("名称", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	metaHeader := newMetaCols([]string{"大小", "类型", "修改时间"}, true)
 	header := container.NewBorder(nil, nil, nameHeader, metaHeader)
 
-	progress := widget.NewProgressBar()
+	progressArea := container.NewVBox()
+	progressScroll := container.NewVScroll(progressArea)
+	progressScroll.SetMinSize(fyne.NewSize(0, 60))
 
 	refreshBtn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), refresh)
 
 	uploadBtn := widget.NewButtonWithIcon("上传文件", theme.UploadIcon(), func() {
 		go func() {
-			localPath, err := zenity.SelectFile(zenity.Title("选择要上传的文件"))
-			if err != nil {
+			paths, err := zenity.SelectFileMultiple(zenity.Title("选择要上传的文件（可多选）"))
+			if err != nil || len(paths) == 0 {
 				return
 			}
-			key := prefix + filepath.Base(localPath)
-			e := awss3.UploadFile(acc, bucket, key, localPath, func(done, total int64) {
-				fyne.Do(func() {
-					if total > 0 {
-						progress.SetValue(float64(done) / float64(total))
-					}
+			tasks := make([]transferTask, 0, len(paths))
+			for _, p := range paths {
+				lp := p
+				key := prefix + filepath.Base(lp)
+				tasks = append(tasks, transferTask{
+					name: filepath.Base(lp),
+					run: func(progress func(done, total int64)) error {
+						return awss3.UploadFile(acc, bucket, key, lp, progress)
+					},
 				})
-			})
+			}
 			fyne.Do(func() {
-				progress.SetValue(0)
-				if e != nil {
-					dialog.ShowError(e, w)
-					return
-				}
-				showInfo("完成", "上传成功", w)
-				refresh()
+				runParallelTransfers(w, progressArea, tasks, refresh)
 			})
 		}()
 	})
 
 	downloadBtn := widget.NewButtonWithIcon("下载文件", theme.DownloadIcon(), func() {
-		if selectedObj == nil || selectedObj.IsDir {
-			showInfo("提示", "请先选择一个文件", w)
+		if len(selectedKeys) == 0 {
+			showInfo("提示", "请先勾选要下载的文件（文件行左侧复选框）", w)
 			return
 		}
-		obj := *selectedObj
+		picked := make([]*awss3.Object, 0, len(selectedKeys))
+		for _, o := range selectedKeys {
+			picked = append(picked, o)
+		}
 		go func() {
-			savePath, err := zenity.SelectFileSave(
-				zenity.Title("保存到"),
-				zenity.Filename(obj.Name),
-				zenity.ConfirmOverwrite(),
-			)
-			if err != nil {
+			dir, err := zenity.SelectFile(zenity.Title("选择下载到的目录"), zenity.Directory())
+			if err != nil || dir == "" {
 				return
 			}
-			e := awss3.DownloadFile(acc, bucket, obj.Key, savePath, func(done, total int64) {
-				fyne.Do(func() {
-					if total > 0 {
-						progress.SetValue(float64(done) / float64(total))
-					}
+			tasks := make([]transferTask, 0, len(picked))
+			for _, o := range picked {
+				obj := o
+				savePath := filepath.Join(dir, obj.Name)
+				tasks = append(tasks, transferTask{
+					name: obj.Name,
+					run: func(progress func(done, total int64)) error {
+						return awss3.DownloadFile(acc, bucket, obj.Key, savePath, progress)
+					},
 				})
-			})
+			}
+			firstPath := filepath.Join(dir, picked[0].Name)
 			fyne.Do(func() {
-				progress.SetValue(0)
-				if e != nil {
-					dialog.ShowError(e, w)
-					return
-				}
-				revealInExplorer(savePath)
-				showInfo("完成", "下载成功", w)
+				runParallelTransfers(w, progressArea, tasks, func() { revealInExplorer(firstPath) })
 			})
 		}()
 	})
@@ -872,9 +1136,9 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), acc *model
 	}
 	msgScroll := container.NewVScroll(msgLabel)
 	msgScroll.SetMinSize(fyne.NewSize(0, 60))
-	bottom := container.NewVBox(actionBar, progress, msgScroll)
+	bottom := container.NewVBox(actionBar, progressScroll, msgScroll)
 
-	breadcrumb := buildBreadcrumb(w, setRight, acc, bucket, prefix)
+	breadcrumb := buildBreadcrumb(w, setRight, s, acc, bucket, prefix)
 	top := container.NewVBox(breadcrumb, filterEntry, header)
 	setRight(container.NewBorder(top, bottom, nil, nil, container.NewVScroll(list)))
 }
@@ -906,9 +1170,206 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// editAccount 弹出账号编辑表单；acc 为 nil 表示新增。
+// spConfig 把 model.Account 转成 sharepoint.Config。
+func spConfig(acc *model.Account) *sharepoint.Config {
+	return &sharepoint.Config{
+		TenantID:     acc.TenantID,
+		ClientID:     acc.ClientID,
+		ClientSecret: acc.ClientSecret,
+		SiteURL:      acc.SiteURL,
+	}
+}
+
+// showSharePointDrives 在右侧面板显示 SharePoint 账号下的文档库列表。
+func showSharePointDrives(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account) {
+	loading := widget.NewLabel(fmt.Sprintf("正在加载 %s 的文档库...", acc.Name))
+	setRight(loading)
+
+	go func() {
+		cfg := spConfig(acc)
+		drives, err := sharepoint.ListDrives(context.Background(), cfg)
+		fyne.Do(func() {
+			if err != nil {
+				setRight(widget.NewLabel(fmt.Sprintf("加载失败: %v", err)))
+				return
+			}
+			list := container.NewVBox()
+			for _, d := range drives {
+				drv := d
+				row := newTappableRow(drv.Name, theme.StorageIcon(), nil,
+					func() { showSharePointItems(w, setRight, s, acc, drv.ID, drv.Name, "") },
+				)
+				list.Add(row)
+			}
+			title := widget.NewLabelWithStyle(
+				fmt.Sprintf("账号 %s — 共 %d 个文档库（双击进入）", acc.Name, len(drives)),
+				fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			setRight(container.NewBorder(title, nil, nil, nil, container.NewVScroll(list)))
+		})
+	}()
+}
+
+// showSharePointItems 加载 SharePoint 文档库中某路径下的内容并构建浏览器视图。
+func showSharePointItems(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, driveID, driveName, itemPath string) {
+	loading := widget.NewLabel(fmt.Sprintf("正在加载 %s/%s ...", driveName, itemPath))
+	setRight(loading)
+
+	go func() {
+		cfg := spConfig(acc)
+		items, err := sharepoint.ListChildren(context.Background(), cfg, driveID, itemPath)
+		fyne.Do(func() {
+			buildSharePointView(w, setRight, s, acc, driveID, driveName, itemPath, items, err)
+		})
+	}()
+}
+
+// buildSharePointView 构建 SharePoint 文件浏览器视图。
+func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, driveID, driveName, itemPath string, items []sharepoint.Item, loadErr error) {
+	var rows []*tappableRow
+	selectedKeys := map[string]*sharepoint.Item{}
+
+	selectRow := func(idx int) {
+		for i, r := range rows {
+			r.setSelected(i == idx)
+		}
+	}
+
+	list := container.NewVBox()
+
+	// 返回按钮
+	backBtn := newTappableRow("⬆ 返回上一级", theme.NavigateBackIcon(), nil, func() {
+		if itemPath == "" {
+			showSharePointDrives(w, setRight, s, acc)
+			return
+		}
+		showSharePointItems(w, setRight, s, acc, driveID, driveName, spParentPath(itemPath))
+	})
+	rows = append(rows, backBtn)
+	list.Add(backBtn)
+
+	if loadErr != nil {
+		list.Add(widget.NewLabel("⚠ 加载失败: " + loadErr.Error()))
+	}
+
+	for _, it := range items {
+		item := it
+		idx := len(rows)
+		if item.IsFolder {
+			row := newTappableRowDetail(item.Name, []string{"", "文件夹", ""}, theme.FolderIcon(),
+				func() { selectRow(idx) },
+				func() {
+					subPath := itemPath
+					if subPath != "" && !strings.HasSuffix(subPath, "/") {
+						subPath += "/"
+					}
+					subPath += item.Name
+					showSharePointItems(w, setRight, s, acc, driveID, driveName, subPath)
+				},
+			)
+			rows = append(rows, row)
+			list.Add(row)
+		} else {
+			meta := []string{
+				humanSize(item.Size),
+				"",
+				item.LastModified.Local().Format("2006-01-02 15:04"),
+			}
+			row := newTappableRowDetail(item.Name, meta, theme.FileIcon(),
+				func() {
+					selectRow(idx)
+				}, nil).withCheck(func(checked bool) {
+				if checked {
+					selectedKeys[item.ID] = &item
+				} else {
+					delete(selectedKeys, item.ID)
+				}
+				selectRow(idx)
+			})
+			rows = append(rows, row)
+			list.Add(row)
+		}
+	}
+
+	// 面包屑
+	crumbs := container.NewHBox()
+	driveLink := widget.NewHyperlink(driveName, nil)
+	driveLink.OnTapped = func() { showSharePointItems(w, setRight, s, acc, driveID, driveName, "") }
+	crumbs.Add(driveLink)
+	if itemPath != "" {
+		parts := strings.Split(strings.TrimSuffix(itemPath, "/"), "/")
+		for i, part := range parts {
+			crumbs.Add(widget.NewLabel("/"))
+			seg := strings.Join(parts[:i+1], "/")
+			link := widget.NewHyperlink(part, nil)
+			link.OnTapped = func() { showSharePointItems(w, setRight, s, acc, driveID, driveName, seg) }
+			crumbs.Add(link)
+		}
+	}
+
+	nameHeader := widget.NewLabelWithStyle("名称", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	metaHeader := newMetaCols([]string{"大小", "", "修改时间"}, true)
+	header := container.NewBorder(nil, nil, nameHeader, metaHeader)
+
+	progressArea := container.NewVBox()
+	progressScroll := container.NewVScroll(progressArea)
+	progressScroll.SetMinSize(fyne.NewSize(0, 60))
+
+	refreshBtn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), func() {
+		showSharePointItems(w, setRight, s, acc, driveID, driveName, itemPath)
+	})
+	downloadBtn := widget.NewButtonWithIcon("下载文件", theme.DownloadIcon(), func() {
+		if len(selectedKeys) == 0 {
+			showInfo("提示", "请先勾选要下载的文件（文件行左侧复选框）", w)
+			return
+		}
+		picked := make([]*sharepoint.Item, 0, len(selectedKeys))
+		for _, it := range selectedKeys {
+			picked = append(picked, it)
+		}
+		go func() {
+			dir, err := zenity.SelectFile(zenity.Title("选择下载到的目录"), zenity.Directory())
+			if err != nil || dir == "" {
+				return
+			}
+			cfg := spConfig(acc)
+			tasks := make([]transferTask, 0, len(picked))
+			for _, it := range picked {
+				item := it
+				savePath := filepath.Join(dir, item.Name)
+				tasks = append(tasks, transferTask{
+					name: item.Name,
+					run: func(progress func(done, total int64)) error {
+						return sharepoint.DownloadItem(context.Background(), cfg, driveID, item.ID, savePath, progress)
+					},
+				})
+			}
+			firstPath := filepath.Join(dir, picked[0].Name)
+			fyne.Do(func() {
+				runParallelTransfers(w, progressArea, tasks, func() { revealInExplorer(firstPath) })
+			})
+		}()
+	})
+
+	actionBar := container.NewHBox(refreshBtn, downloadBtn)
+	bottom := container.NewVBox(actionBar, progressScroll)
+	top := container.NewVBox(crumbs, header)
+	setRight(container.NewBorder(top, bottom, nil, nil, container.NewVScroll(list)))
+}
+
+// spParentPath 返回 SharePoint 路径的上一级，如 "a/b/c" -> "a/b"。
+func spParentPath(p string) string {
+	p = strings.TrimSuffix(p, "/")
+	if idx := strings.LastIndex(p, "/"); idx >= 0 {
+		return p[:idx]
+	}
+	return ""
+}
+
+// editAccount 弹出账号编辑表单；acc 为 nil 表示新增。支持 S3 和 SharePoint 两种类型。
 func editAccount(w fyne.Window, s *store.Store, acc *model.Account, onDone func()) {
 	name := widget.NewEntry()
+
+	// S3 字段
 	endpoint := widget.NewEntry()
 	endpoint.SetPlaceHolder("留空则使用 AWS 默认端点")
 	region := widget.NewEntry()
@@ -917,45 +1378,110 @@ func editAccount(w fyne.Window, s *store.Store, acc *model.Account, onDone func(
 	secretKey := widget.NewPasswordEntry()
 	pathStyle := widget.NewCheck("使用 Path-Style (兼容 MinIO 等)", nil)
 
-	isEdit := acc != nil
-	if isEdit {
-		name.SetText(acc.Name)
-		endpoint.SetText(acc.Endpoint)
-		region.SetText(acc.Region)
-		accessKey.SetText(acc.AccessKeyID)
-		secretKey.SetText(acc.SecretAccessKey)
-		pathStyle.SetChecked(acc.UsePathStyle)
-	}
+	// SharePoint 字段
+	tenantID := widget.NewEntry()
+	tenantID.SetPlaceHolder("Azure AD 租户 ID")
+	clientID := widget.NewEntry()
+	clientID.SetPlaceHolder("应用注册的 Client ID")
+	clientSecret := widget.NewPasswordEntry()
+	clientSecret.SetPlaceHolder("客户端密钥")
+	siteURL := widget.NewEntry()
+	siteURL.SetPlaceHolder("如 https://contoso.sharepoint.com/sites/TeamA")
 
-	items := []*widget.FormItem{
-		widget.NewFormItem("名称", name),
+	s3Items := []*widget.FormItem{
 		widget.NewFormItem("Endpoint", endpoint),
 		widget.NewFormItem("Region", region),
 		widget.NewFormItem("Access Key ID", accessKey),
 		widget.NewFormItem("Secret Access Key", secretKey),
 		widget.NewFormItem("", pathStyle),
 	}
+	spItems := []*widget.FormItem{
+		widget.NewFormItem("Tenant ID", tenantID),
+		widget.NewFormItem("Client ID", clientID),
+		widget.NewFormItem("Client Secret", clientSecret),
+		widget.NewFormItem("Site URL", siteURL),
+	}
+
+	s3Form := widget.NewForm(s3Items...)
+	spForm := widget.NewForm(spItems...)
+	spForm.Hidden = true
+
+	providerSelect := widget.NewSelect([]string{"S3", "SharePoint"}, func(val string) {
+		if val == "SharePoint" {
+			s3Form.Hidden = true
+			spForm.Hidden = false
+		} else {
+			s3Form.Hidden = false
+			spForm.Hidden = true
+		}
+		s3Form.Refresh()
+		spForm.Refresh()
+	})
+	providerSelect.SetSelected("S3")
+
+	isEdit := acc != nil
+	if isEdit {
+		name.SetText(acc.Name)
+		if acc.IsSharePoint() {
+			providerSelect.SetSelected("SharePoint")
+			tenantID.SetText(acc.TenantID)
+			clientID.SetText(acc.ClientID)
+			clientSecret.SetText(acc.ClientSecret)
+			siteURL.SetText(acc.SiteURL)
+		} else {
+			providerSelect.SetSelected("S3")
+			endpoint.SetText(acc.Endpoint)
+			region.SetText(acc.Region)
+			accessKey.SetText(acc.AccessKeyID)
+			secretKey.SetText(acc.SecretAccessKey)
+			pathStyle.SetChecked(acc.UsePathStyle)
+		}
+	}
+
+	content := container.NewVBox(
+		container.NewBorder(nil, nil, widget.NewLabel("名称"), nil, name),
+		container.NewBorder(nil, nil, widget.NewLabel("类型"), nil, providerSelect),
+		s3Form,
+		spForm,
+	)
+	scroll := container.NewVScroll(content)
+	scroll.SetMinSize(fyne.NewSize(460, 320))
 
 	title := "新增账号"
 	if isEdit {
 		title = "编辑账号"
 	}
 
-	dialog.ShowForm(title, "保存", "取消", items, func(ok bool) {
+	dialog.ShowCustomConfirm(title, "保存", "取消", scroll, func(ok bool) {
 		if !ok {
 			return
 		}
-		if name.Text == "" || accessKey.Text == "" {
-			showInfo("提示", "名称和 Access Key ID 不能为空", w)
+		if name.Text == "" {
+			showInfo("提示", "名称不能为空", w)
 			return
 		}
-		a := &model.Account{
-			Name:            name.Text,
-			Endpoint:        endpoint.Text,
-			Region:          region.Text,
-			AccessKeyID:     accessKey.Text,
-			SecretAccessKey: secretKey.Text,
-			UsePathStyle:    pathStyle.Checked,
+		a := &model.Account{Name: name.Text}
+		if providerSelect.Selected == "SharePoint" {
+			a.Provider = "sharepoint"
+			if tenantID.Text == "" || clientID.Text == "" || clientSecret.Text == "" || siteURL.Text == "" {
+				showInfo("提示", "SharePoint 的所有字段均不能为空", w)
+				return
+			}
+			a.TenantID = tenantID.Text
+			a.ClientID = clientID.Text
+			a.ClientSecret = clientSecret.Text
+			a.SiteURL = siteURL.Text
+		} else {
+			a.Provider = "s3"
+			if accessKey.Text == "" {
+				showInfo("提示", "Access Key ID 不能为空", w)
+				return
+			}
+			a.Endpoint = endpoint.Text
+			a.Region = region.Text
+			a.AccessKeyID = accessKey.Text
+			a.SecretAccessKey = secretKey.Text
+			a.UsePathStyle = pathStyle.Checked
 		}
 		var err error
 		if isEdit {
