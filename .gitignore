@@ -1,4 +1,7 @@
 *.exe
+*.exe~
+s3client
 TODO.md
 build.log
 _cgodiag/
+.idea/
