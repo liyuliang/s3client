@@ -3,6 +3,7 @@
 package sharepoint
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,17 @@ type Config struct {
 	ClientID     string
 	ClientSecret string
 	SiteURL      string
+	ReadOnly     bool // 只读分享：禁止上传/新建文件夹/删除
+}
+
+// ErrReadOnly 表示当前连接是只读分享，不允许写入。
+var ErrReadOnly = errors.New("只读分享配置，禁止写入操作")
+
+func checkWritable(c *Config) error {
+	if c != nil && c.ReadOnly {
+		return ErrReadOnly
+	}
+	return nil
 }
 
 // Item 表示文档库中的一个文件或文件夹。
@@ -122,6 +135,39 @@ func graphGet(ctx context.Context, c *Config, path string, out interface{}) erro
 	return json.Unmarshal(body, out)
 }
 
+// graphDo 带 token 发起任意方法的 Graph 请求，bodyLen 用于设置 Content-Length（0 表示不设置）。
+// out 为 nil 时忽略响应体；2xx 之外的响应都会返回错误。
+func graphDo(ctx context.Context, c *Config, method, path string, body io.Reader, bodyLen int64, contentType string, out interface{}) error {
+	token, err := accessToken(ctx, c)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, graphBase+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if bodyLen > 0 {
+		req.ContentLength = bodyLen
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Graph 请求失败(%d): %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(data, out)
+}
+
 // siteID 把 SiteURL 解析成 Graph 的站点 ID（hostname + server-relative path）。
 func siteID(ctx context.Context, c *Config) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(c.SiteURL))
@@ -177,11 +223,11 @@ func ListDrives(ctx context.Context, c *Config) ([]Drive, error) {
 
 // graphItem 是 Graph driveItem 的部分字段。
 type graphItem struct {
-	ID                  string    `json:"id"`
-	Name                string    `json:"name"`
-	Size                int64     `json:"size"`
+	ID                   string    `json:"id"`
+	Name                 string    `json:"name"`
+	Size                 int64     `json:"size"`
 	LastModifiedDateTime time.Time `json:"lastModifiedDateTime"`
-	Folder              *struct {
+	Folder               *struct {
 		ChildCount int `json:"childCount"`
 	} `json:"folder"`
 	DownloadURL string `json:"@microsoft.graph.downloadUrl"`
@@ -260,6 +306,151 @@ func DownloadItem(ctx context.Context, c *Config, driveID, itemID, localPath str
 	pw := &progressWriter{w: f, total: gi.Size, cb: progress}
 	_, err = io.Copy(pw, resp.Body)
 	return err
+}
+
+// remotePath 构造 Graph 的 "root:/路径/文件名:" 形式的路径片段。
+func remotePath(itemPath, name string) string {
+	p := strings.Trim(itemPath, "/")
+	if p == "" {
+		return "root:/" + url.PathEscape(name) + ":"
+	}
+	return "root:/" + pathEscapeSegments(p) + "/" + url.PathEscape(name) + ":"
+}
+
+// simpleUploadMax 简单上传（单次 PUT）的大小上限，超过则改用上传会话分片上传。
+const simpleUploadMax = 4 << 20
+
+// chunkSize 分片大小 5MB，Graph 要求为 320KB 的整数倍。
+const chunkSize = 5 << 20
+
+// UploadItem 上传本地文件到文档库的 itemPath 目录（空串表示根目录），progress 回调可为 nil。
+func UploadItem(ctx context.Context, c *Config, driveID, itemPath, localPath string, progress func(done, total int64)) error {
+	if err := checkWritable(c); err != nil {
+		return err
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	total := info.Size()
+	remote := remotePath(itemPath, filepath.Base(localPath))
+	base := fmt.Sprintf("/drives/%s/%s", url.PathEscape(driveID), remote)
+	if total <= simpleUploadMax {
+		pr := &progressReader{r: f, total: total, cb: progress}
+		return graphDo(ctx, c, http.MethodPut, base+"/content", pr, total, "application/octet-stream", nil)
+	}
+	return uploadBySession(ctx, c, base, f, total, progress)
+}
+
+// uploadBySession 用 createUploadSession 分片上传大文件。
+func uploadBySession(ctx context.Context, c *Config, base string, f io.Reader, total int64, progress func(done, total int64)) error {
+	body := []byte(`{"item":{"@microsoft.graph.conflictBehavior":"rename"}}`)
+	var sess struct {
+		UploadURL string `json:"uploadUrl"`
+	}
+	if err := graphDo(ctx, c, http.MethodPost, base+"/createUploadSession",
+		bytes.NewReader(body), int64(len(body)), "application/json", &sess); err != nil {
+		return err
+	}
+	if sess.UploadURL == "" {
+		return errors.New("创建上传会话失败")
+	}
+	buf := make([]byte, chunkSize)
+	var done int64
+	for done < total {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			start, end := done, done+int64(n)-1
+			if err := putChunk(ctx, sess.UploadURL, buf[:n], start, end, total); err != nil {
+				return err
+			}
+			done += int64(n)
+			if progress != nil {
+				progress(done, total)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	return nil
+}
+
+// putChunk 上传单个分片（上传会话的 URL 已带授权，无需 Authorization 头）。
+func putChunk(ctx context.Context, uploadURL string, data []byte, start, end, total int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(data))
+	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("分片上传失败(%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// CreateFolder 在文档库的 parentPath（空串为根）下新建文件夹。
+func CreateFolder(ctx context.Context, c *Config, driveID, parentPath, name string) error {
+	if err := checkWritable(c); err != nil {
+		return err
+	}
+	parent := strings.Trim(parentPath, "/")
+	var path string
+	if parent == "" {
+		path = fmt.Sprintf("/drives/%s/root/children", url.PathEscape(driveID))
+	} else {
+		path = fmt.Sprintf("/drives/%s/root:/%s:/children", url.PathEscape(driveID), pathEscapeSegments(parent))
+	}
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":                              name,
+		"folder":                            map[string]interface{}{},
+		"@microsoft.graph.conflictBehavior": "rename",
+	})
+	if err != nil {
+		return err
+	}
+	return graphDo(ctx, c, http.MethodPost, path, bytes.NewReader(payload), int64(len(payload)), "application/json", nil)
+}
+
+// DeleteItem 删除文档库中指定 itemID 的文件或文件夹。
+func DeleteItem(ctx context.Context, c *Config, driveID, itemID string) error {
+	if err := checkWritable(c); err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/drives/%s/items/%s", url.PathEscape(driveID), url.PathEscape(itemID))
+	return graphDo(ctx, c, http.MethodDelete, path, nil, 0, "", nil)
+}
+
+// progressReader 包装 io.Reader，每次读取后回调进度（用于上传）。
+type progressReader struct {
+	r     io.Reader
+	done  int64
+	total int64
+	cb    func(done, total int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.done += int64(n)
+	if p.cb != nil {
+		p.cb(p.done, p.total)
+	}
+	return n, err
 }
 
 // TestConnection 通过列出文档库验证凭据与站点是否有效。

@@ -37,21 +37,35 @@ type file struct {
 
 // payload 是加密载荷的明文结构。
 type payload struct {
-	ShareName       string    `json:"share_name"`
-	Bucket          string    `json:"bucket"`
-	ExpiresAt       time.Time `json:"expires_at"`
-	ReadOnly        bool      `json:"read_only"`
-	Endpoint        string    `json:"endpoint"`
-	Region          string    `json:"region"`
-	AccessKeyID     string    `json:"access_key_id"`
-	SecretAccessKey string    `json:"secret_access_key"`
-	UsePathStyle    bool      `json:"use_path_style"`
+	ShareName string    `json:"share_name"`
+	Provider  string    `json:"provider"` // "s3"（默认）或 "sharepoint"
+	ExpiresAt time.Time `json:"expires_at"`
+	ReadOnly  bool      `json:"read_only"`
+	// S3 目标与凭据
+	Bucket          string `json:"bucket"`
+	Endpoint        string `json:"endpoint"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretAccessKey string `json:"secret_access_key"`
+	UsePathStyle    bool   `json:"use_path_style"`
+	// SharePoint 目标与凭据
+	DriveID      string `json:"drive_id"`
+	DriveName    string `json:"drive_name"`
+	ItemPath     string `json:"item_path"`
+	TenantID     string `json:"tenant_id"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	SiteURL      string `json:"site_url"`
 }
 
 // Session 是加载分享配置后得到的只读会话，只在内存中存在，不写入账号库。
 type Session struct {
 	Name      string
-	Bucket    string
+	Provider  string // "s3" 或 "sharepoint"
+	Bucket    string // S3：bucket 名
+	DriveID   string // SharePoint：文档库 ID
+	DriveName string // SharePoint：文档库名
+	ItemPath  string // SharePoint：分享的文件夹路径
 	ExpiresAt time.Time
 	Account   *model.Account
 }
@@ -89,28 +103,61 @@ func Create(name, bucket string, acc *model.Account, ttl time.Duration, password
 	if acc == nil {
 		return nil, errors.New("账号不能为空")
 	}
-	if ttl < 0 {
-		return nil, errors.New("有效期不能为负数")
-	}
-	var expiresAt time.Time
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl)
-	}
-	plain, err := json.Marshal(payload{
+	return encode(payload{
 		ShareName:       name,
+		Provider:        "s3",
 		Bucket:          bucket,
-		ExpiresAt:       expiresAt,
+		ExpiresAt:       expiresAtOf(ttl),
 		ReadOnly:        true,
 		Endpoint:        acc.Endpoint,
 		Region:          acc.Region,
 		AccessKeyID:     acc.AccessKeyID,
 		SecretAccessKey: acc.SecretAccessKey,
 		UsePathStyle:    acc.UsePathStyle,
-	})
+	}, ttl, password)
+}
+
+// CreateSharePoint 生成 SharePoint 文档库文件夹的只读分享配置（默认分享整个文档库）。
+// itemPath 为空表示文档库根目录。
+func CreateSharePoint(name string, acc *model.Account, driveID, driveName, itemPath string, ttl time.Duration, password string) ([]byte, error) {
+	if driveID == "" {
+		return nil, errors.New("文档库不能为空")
+	}
+	if acc == nil {
+		return nil, errors.New("账号不能为空")
+	}
+	return encode(payload{
+		ShareName:    name,
+		Provider:     "sharepoint",
+		ExpiresAt:    expiresAtOf(ttl),
+		ReadOnly:     true,
+		DriveID:      driveID,
+		DriveName:    driveName,
+		ItemPath:     itemPath,
+		TenantID:     acc.TenantID,
+		ClientID:     acc.ClientID,
+		ClientSecret: acc.ClientSecret,
+		SiteURL:      acc.SiteURL,
+	}, ttl, password)
+}
+
+func expiresAtOf(ttl time.Duration) time.Time {
+	if ttl > 0 {
+		return time.Now().Add(ttl)
+	}
+	return time.Time{}
+}
+
+// encode 校验有效期并把载荷用口令加密成分享配置文件。
+// password 为空表示「免口令」：自动生成随机口令随文件保存，打开时无需输入。
+func encode(p payload, ttl time.Duration, password string) ([]byte, error) {
+	if ttl < 0 {
+		return nil, errors.New("有效期不能为负数")
+	}
+	plain, err := json.Marshal(p)
 	if err != nil {
 		return nil, err
 	}
-	// 免口令模式：随机口令写入文件，接收方无需输入
 	unlockCode := ""
 	if password == "" {
 		password = randomCode()
@@ -183,24 +230,41 @@ func Open(data []byte, password string) (*Session, error) {
 	if !p.ReadOnly {
 		return nil, errors.New("分享配置不是只读类型，已拒绝加载")
 	}
+	provider := p.Provider
+	if provider == "" {
+		provider = "s3"
+	}
 	name := p.ShareName
 	if name == "" {
 		name = p.Bucket
 	}
-	return &Session{
+	sess := &Session{
 		Name:      name,
+		Provider:  provider,
 		Bucket:    p.Bucket,
+		DriveID:   p.DriveID,
+		DriveName: p.DriveName,
+		ItemPath:  p.ItemPath,
 		ExpiresAt: p.ExpiresAt,
 		Account: &model.Account{
-			Name:            name,
-			Provider:        "s3",
-			Endpoint:        p.Endpoint,
-			Region:          p.Region,
-			AccessKeyID:     p.AccessKeyID,
-			SecretAccessKey: p.SecretAccessKey,
-			UsePathStyle:    p.UsePathStyle,
-			ReadOnly:        true,
-			ShareExpiresAt:  p.ExpiresAt,
+			Name:           name,
+			Provider:       provider,
+			ReadOnly:       true,
+			ShareExpiresAt: p.ExpiresAt,
 		},
-	}, nil
+	}
+	if provider == "sharepoint" {
+		sess.Account.ShareSPPath = p.ItemPath
+		sess.Account.TenantID = p.TenantID
+		sess.Account.ClientID = p.ClientID
+		sess.Account.ClientSecret = p.ClientSecret
+		sess.Account.SiteURL = p.SiteURL
+		return sess, nil
+	}
+	sess.Account.Endpoint = p.Endpoint
+	sess.Account.Region = p.Region
+	sess.Account.AccessKeyID = p.AccessKeyID
+	sess.Account.SecretAccessKey = p.SecretAccessKey
+	sess.Account.UsePathStyle = p.UsePathStyle
+	return sess, nil
 }

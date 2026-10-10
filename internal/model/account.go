@@ -17,6 +17,7 @@ type Account struct {
 	SiteURL         string // SharePoint: 站点 URL
 	ReadOnly        bool      // 只读（由分享配置加载，仅内存使用，不入库）：禁止任何写操作
 	ShareExpiresAt  time.Time // 分享有效期（仅内存使用，零值表示不限期）
+	ShareSPPath     string    // 分享的 SharePoint 根目录路径（仅内存使用）：只读分享不允许回到该目录之上
 }
 
 func (a *Account) IsSharePoint() bool {

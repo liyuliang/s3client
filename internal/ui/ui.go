@@ -1,12 +1,12 @@
 package ui
 
 import (
-	_ "embed"
+	"context"
 	"crypto/rand"
+	_ "embed"
 	"errors"
 	"fmt"
 	"image/color"
-	"context"
 	mrand "math/rand/v2"
 	"os"
 	"os/exec"
@@ -82,6 +82,17 @@ func Run() {
 	a.SetIcon(fyne.NewStaticResource("icon.ico", iconData()))
 	w := a.NewWindow("S3 Client")
 	w.Resize(fyne.NewSize(960, 600))
+
+	// 关闭窗口时二次确认，避免误关（尤其是传输进行中）
+	w.SetCloseIntercept(func() {
+		dialog.ShowConfirm("确认退出", "确定要关闭 S3 Client 吗？", func(ok bool) {
+			if !ok {
+				return
+			}
+			w.Close()
+			a.Quit()
+		}, w)
+	})
 
 	showUnlock(w)
 
@@ -176,11 +187,12 @@ func newMetaCols(meta []string, bold bool) fyne.CanvasObject {
 // tappableRow 是一个支持单击选中、双击打开、右键的列表行，可选右侧固定元数据列。
 type tappableRow struct {
 	widget.BaseWidget
-	text         string
-	meta         []string
-	icon         fyne.Resource
-	selected     bool
-	nameColor    color.Color
+	text          string
+	meta          []string
+	icon          fyne.Resource
+	selected      bool
+	nameColor     color.Color
+	badge         fyne.Resource
 	check         *widget.Check
 	onTapped      func()
 	onDoubleTap   func()
@@ -207,6 +219,12 @@ func (r *tappableRow) withSecondaryMenu(items ...*fyne.MenuItem) *tappableRow {
 
 func (r *tappableRow) withColor(c color.Color) *tappableRow {
 	r.nameColor = c
+	return r
+}
+
+// withBadge 在名称后面加一个小图标（用于标注账号类型等）。
+func (r *tappableRow) withBadge(res fyne.Resource) *tappableRow {
+	r.badge = res
 	return r
 }
 
@@ -288,6 +306,9 @@ func (r *tappableRow) CreateRenderer() fyne.WidgetRenderer {
 		left = container.NewHBox(r.check, icon, nameObj)
 	} else {
 		left = container.NewHBox(icon, nameObj)
+	}
+	if r.badge != nil {
+		left.Add(widget.NewIcon(r.badge))
 	}
 	var content *fyne.Container
 	if cols := newMetaCols(r.meta, false); cols != nil {
@@ -444,6 +465,10 @@ func openShare(w fyne.Window, setRight func(fyne.CanvasObject), sess *share.Sess
 			fmt.Sprintf("该分享的有效期已于 %s 结束，无法使用。", sess.ExpiresAt.Local().Format("2006-01-02 15:04")), w)
 		return
 	}
+	if sess.Provider == "sharepoint" {
+		showSharePointItems(w, setRight, nil, sess.Account, sess.DriveID, sess.DriveName, sess.ItemPath)
+		return
+	}
 	showObjects(w, setRight, nil, sess.Account, sess.Bucket, "")
 }
 
@@ -482,8 +507,29 @@ func randomShareCode() string {
 
 // showCreateShare 生成当前 bucket 的只读分享配置并保存到文件。
 func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
+	showCreateShareDialog(w, bucket, bucket+"-readonly.s3share",
+		func(name string, ttl time.Duration, password string) ([]byte, error) {
+			return share.Create(name, bucket, acc, ttl, password)
+		})
+}
+
+// showCreateSharePointShare 生成当前 SharePoint 文件夹的只读分享配置并保存到文件。
+func showCreateSharePointShare(w fyne.Window, acc *model.Account, driveID, driveName, itemPath string) {
+	def := driveName
+	if itemPath != "" {
+		def = driveName + "/" + itemPath
+	}
+	showCreateShareDialog(w, def, "sharepoint-readonly.s3share",
+		func(name string, ttl time.Duration, password string) ([]byte, error) {
+			return share.CreateSharePoint(name, acc, driveID, driveName, itemPath, ttl, password)
+		})
+}
+
+// showCreateShareDialog 只读分享配置生成对话框：名称 / 有效期 / 口令，生成后保存为文件。
+func showCreateShareDialog(w fyne.Window, defaultName, defaultFile string,
+	create func(name string, ttl time.Duration, password string) ([]byte, error)) {
 	nameEntry := widget.NewEntry()
-	nameEntry.SetText(bucket)
+	nameEntry.SetText(defaultName)
 	hoursEntry := widget.NewEntry()
 	hoursEntry.SetText("24")
 	pw := widget.NewEntry()
@@ -512,57 +558,57 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 	scroll.SetMinSize(fyne.NewSize(420, 260))
 	dialog.ShowCustomConfirm("生成只读分享配置", "生成并保存", "取消",
 		container.NewVBox(scroll, hint), func(ok bool) {
-		if !ok {
-			return
-		}
-		hours := 0
-		if v, err := fmt.Sscanf(hoursEntry.Text, "%d", &hours); err != nil || v != 1 || hours < 0 {
-			hours = 0
-		}
-		ttl := time.Duration(hours) * time.Hour
-		data, err := share.Create(nameEntry.Text, bucket, acc, ttl, pw.Text)
-		if err != nil {
-			dialog.ShowError(err, w)
-			return
-		}
-		expText := "不限期（0 小时）"
-		if ttl > 0 {
-			expText = fmt.Sprintf("%d 小时（至 %s）", hours, time.Now().Add(ttl).Local().Format("2006-01-02 15:04"))
-		}
-		// 留空口令 = 免口令：随机口令随文件保存，对方拿到文件即可打开
-		pwText := "免口令（口令随文件保存，对方无需输入）"
-		if pw.Text != "" {
-			pwText = "分享口令：" + pw.Text
-		}
-		go func() {
-			savePath, zerr := zenity.SelectFileSave(
-				zenity.Title("保存分享配置文件"),
-				zenity.Filename(bucket+"-readonly.s3share"),
-				zenity.ConfirmOverwrite(),
-			)
-			if zerr != nil {
+			if !ok {
 				return
 			}
-			werr := os.WriteFile(savePath, data, 0600)
-			fyne.Do(func() {
-				if werr != nil {
-					dialog.ShowError(werr, w)
+			hours := 0
+			if v, err := fmt.Sscanf(hoursEntry.Text, "%d", &hours); err != nil || v != 1 || hours < 0 {
+				hours = 0
+			}
+			ttl := time.Duration(hours) * time.Hour
+			data, err := create(nameEntry.Text, ttl, pw.Text)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			expText := "不限期（0 小时）"
+			if ttl > 0 {
+				expText = fmt.Sprintf("%d 小时（至 %s）", hours, time.Now().Add(ttl).Local().Format("2006-01-02 15:04"))
+			}
+			// 留空口令 = 免口令：随机口令随文件保存，对方拿到文件即可打开
+			pwText := "免口令（口令随文件保存，对方无需输入）"
+			if pw.Text != "" {
+				pwText = "分享口令：" + pw.Text
+			}
+			go func() {
+				savePath, zerr := zenity.SelectFileSave(
+					zenity.Title("保存分享配置文件"),
+					zenity.Filename(defaultFile),
+					zenity.ConfirmOverwrite(),
+				)
+				if zerr != nil {
 					return
 				}
-				showInfo("完成", fmt.Sprintf(
-					"已生成只读分享配置：\n%s\n\n有效期：%s\n\n%s",
-					savePath, expText, pwText), w)
-			})
-		}()
-	}, w)
+				werr := os.WriteFile(savePath, data, 0600)
+				fyne.Do(func() {
+					if werr != nil {
+						dialog.ShowError(werr, w)
+						return
+					}
+					showInfo("完成", fmt.Sprintf(
+						"已生成只读分享配置：\n%s\n\n有效期：%s\n\n%s",
+						savePath, expText, pwText), w)
+				})
+			}()
+		}, w)
 }
 
-// accountLabel 返回带类型标记的账号显示名：S3 账号标「S3」，SharePoint 账号标「SP」。
-func accountLabel(name string, isSharePoint bool) string {
+// providerIcon 返回账号类型的小图标：S3 用存储图标，SharePoint 用站点图标。
+func providerIcon(isSharePoint bool) fyne.Resource {
 	if isSharePoint {
-		return name + "（SP）"
+		return theme.ComputerIcon()
 	}
-	return name + "（S3）"
+	return theme.StorageIcon()
 }
 
 // showMain 显示账号管理主界面：左侧账号，右侧 Bucket/对象浏览。
@@ -671,11 +717,11 @@ func showMain(w fyne.Window, s *store.Store, initialShare *share.Session) {
 		for i := range accounts {
 			idx := i
 			acc := accounts[i]
-			row := newTappableRow(accountLabel(acc.Name, acc.IsSharePoint()), theme.AccountIcon(),
+			row := newTappableRow(acc.Name, theme.AccountIcon(),
 				func() { selectRow(idx) },
 				func() {
 					selectRow(idx)
-					openTab(fmt.Sprintf("acc:%d", acc.ID), accountLabel(acc.Name, acc.IsSharePoint()), func(setRight func(fyne.CanvasObject)) {
+					openTab(fmt.Sprintf("acc:%d", acc.ID), acc.Name, func(setRight func(fyne.CanvasObject)) {
 						if acc.IsSharePoint() {
 							showSharePointDrives(w, setRight, s, &acc)
 						} else {
@@ -683,7 +729,7 @@ func showMain(w fyne.Window, s *store.Store, initialShare *share.Session) {
 						}
 					})
 				},
-			).withSecondaryMenu(
+			).withBadge(providerIcon(acc.IsSharePoint())).withSecondaryMenu(
 				fyne.NewMenuItem("编辑账号...", func() { selectRow(idx); doEdit(acc) }),
 				fyne.NewMenuItem("删除账号", func() { selectRow(idx); doDelete(acc) }),
 				fyne.NewMenuItem("测试连接", func() { selectRow(idx); doTest(acc) }),
@@ -693,7 +739,7 @@ func showMain(w fyne.Window, s *store.Store, initialShare *share.Session) {
 		}
 		keep := map[string]string{}
 		for _, a := range accounts {
-			keep[fmt.Sprintf("acc:%d", a.ID)] = accountLabel(a.Name, a.IsSharePoint())
+			keep[fmt.Sprintf("acc:%d", a.ID)] = a.Name
 		}
 		for i, sess := range sessions {
 			key := fmt.Sprintf("share:%p", sess)
@@ -925,10 +971,12 @@ func showMain(w fyne.Window, s *store.Store, initialShare *share.Session) {
 			doTest(acc)
 		}
 	})
-	loadShareItem := fyne.NewMenuItem("加载分享配置...", func() { loadShare(w, func(sess *share.Session) {
-		sessions = append(sessions, sess)
-		reload()
-	}) })
+	loadShareItem := fyne.NewMenuItem("加载分享配置...", func() {
+		loadShare(w, func(sess *share.Session) {
+			sessions = append(sessions, sess)
+			reload()
+		})
+	})
 	shareMenu := fyne.NewMenu("分享", loadShareItem)
 	if s == nil {
 		// 未解锁账号库：只提供分享浏览与回到解锁界面
@@ -1583,6 +1631,7 @@ func spConfig(acc *model.Account) *sharepoint.Config {
 		ClientID:     acc.ClientID,
 		ClientSecret: acc.ClientSecret,
 		SiteURL:      acc.SiteURL,
+		ReadOnly:     acc.ReadOnly,
 	}
 }
 
@@ -1631,18 +1680,27 @@ func showSharePointItems(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 
 // buildSharePointView 构建 SharePoint 文件浏览器视图。
 func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, driveID, driveName, itemPath string, items []sharepoint.Item, loadErr error) {
+	readOnly := acc.ReadOnly
+	if readOnly && acc.ShareExpired() {
+		setRight(widget.NewLabel(fmt.Sprintf("🔒 该分享配置的有效期已于 %s 结束，无法继续访问。",
+			acc.ShareExpiresAt.Local().Format("2006-01-02 15:04"))))
+		return
+	}
+
 	var rows []*tappableRow
+	var selectedItem *sharepoint.Item
 	selectedKeys := map[string]*sharepoint.Item{}
 
-	selectRow := func(idx int) {
+	selectRow := func(idx int, it *sharepoint.Item) {
 		for i, r := range rows {
 			r.setSelected(i == idx)
 		}
+		selectedItem = it
 	}
 
 	list := container.NewVBox()
 
-	// 返回按钮
+	// 返回按钮：只读分享不允许回到分享目录之外（也不能跳到文档库列表）
 	backBtn := newTappableRow("⬆ 返回上一级", theme.NavigateBackIcon(), nil, func() {
 		if itemPath == "" {
 			showSharePointDrives(w, setRight, s, acc)
@@ -1650,8 +1708,10 @@ func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 		}
 		showSharePointItems(w, setRight, s, acc, driveID, driveName, spParentPath(itemPath))
 	})
-	rows = append(rows, backBtn)
-	list.Add(backBtn)
+	if !readOnly || (itemPath != "" && spWithinRoot(spParentPath(itemPath), acc.ShareSPPath)) {
+		rows = append(rows, backBtn)
+		list.Add(backBtn)
+	}
 
 	if loadErr != nil {
 		list.Add(widget.NewLabel("⚠ 加载失败: " + loadErr.Error()))
@@ -1662,7 +1722,7 @@ func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 		idx := len(rows)
 		if item.IsFolder {
 			row := newTappableRowDetail(item.Name, []string{"", "文件夹", ""}, theme.FolderIcon(),
-				func() { selectRow(idx) },
+				func() { selectRow(idx, &item) },
 				func() {
 					subPath := itemPath
 					if subPath != "" && !strings.HasSuffix(subPath, "/") {
@@ -1682,14 +1742,14 @@ func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 			}
 			row := newTappableRowDetail(item.Name, meta, theme.FileIcon(),
 				func() {
-					selectRow(idx)
+					selectRow(idx, &item)
 				}, nil).withCheck(func(checked bool) {
 				if checked {
 					selectedKeys[item.ID] = &item
 				} else {
 					delete(selectedKeys, item.ID)
 				}
-				selectRow(idx)
+				selectRow(idx, &item)
 			})
 			rows = append(rows, row)
 			list.Add(row)
@@ -1728,6 +1788,9 @@ func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 			showInfo("提示", "请先勾选要下载的文件（文件行左侧复选框）", w)
 			return
 		}
+		if !checkShareValid(w, acc) {
+			return
+		}
 		picked := make([]*sharepoint.Item, 0, len(selectedKeys))
 		for _, it := range selectedKeys {
 			picked = append(picked, it)
@@ -1756,10 +1819,103 @@ func buildSharePointView(w fyne.Window, setRight func(fyne.CanvasObject), s *sto
 		}()
 	})
 
-	actionBar := container.NewHBox(refreshBtn, downloadBtn)
+	bar := []fyne.CanvasObject{refreshBtn, downloadBtn}
+	if !readOnly {
+		uploadBtn := widget.NewButtonWithIcon("上传文件", theme.UploadIcon(), func() {
+			go func() {
+				paths, err := zenity.SelectFileMultiple(zenity.Title("选择要上传的文件（可多选）"))
+				if err != nil || len(paths) == 0 {
+					return
+				}
+				cfg := spConfig(acc)
+				tasks := make([]transferTask, 0, len(paths))
+				for _, p := range paths {
+					lp := p
+					tasks = append(tasks, transferTask{
+						name: filepath.Base(lp),
+						run: func(progress func(done, total int64)) error {
+							return sharepoint.UploadItem(context.Background(), cfg, driveID, itemPath, lp, progress)
+						},
+					})
+				}
+				fyne.Do(func() {
+					runParallelTransfers(w, progressArea, tasks, func() {
+						showSharePointItems(w, setRight, s, acc, driveID, driveName, itemPath)
+					})
+				})
+			}()
+		})
+
+		mkdirBtn := widget.NewButtonWithIcon("新建文件夹", theme.FolderNewIcon(), func() {
+			entry := widget.NewEntry()
+			entry.SetPlaceHolder("文件夹名")
+			dialog.ShowForm("新建文件夹", "创建", "取消",
+				[]*widget.FormItem{widget.NewFormItem("名称", entry)}, func(ok bool) {
+					if !ok || entry.Text == "" {
+						return
+					}
+					go func() {
+						e := sharepoint.CreateFolder(context.Background(), spConfig(acc), driveID, itemPath, entry.Text)
+						fyne.Do(func() {
+							if e != nil {
+								dialog.ShowError(e, w)
+								return
+							}
+							showSharePointItems(w, setRight, s, acc, driveID, driveName, itemPath)
+						})
+					}()
+				}, w)
+		})
+
+		deleteBtn := widget.NewButtonWithIcon("删除", theme.DeleteIcon(), func() {
+			if selectedItem == nil {
+				showInfo("提示", "请先选择一个文件或文件夹", w)
+				return
+			}
+			it := *selectedItem
+			kind := "文件"
+			if it.IsFolder {
+				kind = "文件夹（包含其中的全部内容）"
+			}
+			dialog.ShowConfirm("确认删除", fmt.Sprintf("确定删除%s %q 吗？", kind, it.Name), func(ok bool) {
+				if !ok {
+					return
+				}
+				dialog.ShowConfirm("再次确认", fmt.Sprintf("此操作不可撤销，确定要删除 %q 吗？", it.Name), func(ok2 bool) {
+					if !ok2 {
+						return
+					}
+					go func() {
+						e := sharepoint.DeleteItem(context.Background(), spConfig(acc), driveID, it.ID)
+						fyne.Do(func() {
+							if e != nil {
+								dialog.ShowError(e, w)
+								return
+							}
+							showSharePointItems(w, setRight, s, acc, driveID, driveName, itemPath)
+						})
+					}()
+				}, w)
+			}, w)
+		})
+
+		shareBtn := widget.NewButtonWithIcon("分享只读", theme.MailSendIcon(), func() {
+			showCreateSharePointShare(w, acc, driveID, driveName, itemPath)
+		})
+		bar = []fyne.CanvasObject{refreshBtn, uploadBtn, downloadBtn, deleteBtn, mkdirBtn, shareBtn}
+	}
+	actionBar := container.NewHBox(bar...)
 	bottom := container.NewVBox(actionBar, progressScroll)
 	top := container.NewVBox(crumbs, header)
 	setRight(container.NewBorder(top, bottom, nil, nil, container.NewVScroll(list)))
+}
+
+// spWithinRoot 判断 SharePoint 路径 path 是否仍在分享根目录 root 之内（root 为空表示整个文档库）。
+func spWithinRoot(path, root string) bool {
+	if root == "" {
+		return true
+	}
+	return path == root || strings.HasPrefix(path, root+"/")
 }
 
 // spParentPath 返回 SharePoint 路径的上一级，如 "a/b/c" -> "a/b"。
