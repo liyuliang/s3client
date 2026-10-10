@@ -131,14 +131,18 @@ func showUnlock(w fyne.Window) {
 	btn := widget.NewButtonWithIcon(action, theme.ConfirmIcon(), doUnlock)
 
 	// 不需要账号库也能查看别人分享的 bucket（只读）
-	shareBtn := widget.NewButtonWithIcon("加载分享配置（无需解锁）", theme.MailAttachmentIcon(), func() {
+	shareBtn := widget.NewButtonWithIcon("加载分享配置", theme.MailAttachmentIcon(), func() {
 		loadShare(w, func(sess *share.Session) { showMain(w, nil, sess) })
 	})
+
+	gap := canvas.NewRectangle(color.Transparent)
+	gap.SetMinSize(fyne.NewSize(0, 10))
 
 	inputRow := container.NewBorder(nil, nil, nil, btn, pwd)
 	box := container.NewVBox(
 		widget.NewLabelWithStyle(title, fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		inputRow,
+		gap,
 		shareBtn,
 	)
 	card := container.NewGridWrap(fyne.NewSize(420, 140), box)
