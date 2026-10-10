@@ -6,6 +6,7 @@
 package share
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,9 @@ import (
 // Version 是当前分享配置文件格式版本。
 const Version = 1
 
+// ErrPasswordRequired 表示该文件需要输入分享口令才能打开。
+var ErrPasswordRequired = errors.New("该分享配置需要输入分享口令")
+
 // file 是分享配置文件的明文外层结构。
 type file struct {
 	Version      int    `json:"version"`
@@ -27,6 +31,8 @@ type file struct {
 	ArgonThreads uint8  `json:"argon_threads"`
 	Salt         string `json:"salt"`    // base64
 	Payload      string `json:"payload"` // AES-256-GCM(base64(nonce||cipher||tag))
+	// UnlockCode 仅在选择「免口令」时写入：口令随文件保存，打开时无需输入。
+	UnlockCode string `json:"unlock_code,omitempty"`
 }
 
 // payload 是加密载荷的明文结构。
@@ -74,11 +80,9 @@ func (s *Session) Remaining() string {
 }
 
 // Create 生成一个加密的只读分享配置文件。
-// ttl <= 0 表示不限制有效期；password 为分享口令，由分享者另行告知接收方。
+// ttl <= 0 表示不限制有效期；password 为空表示「免口令」：
+// 自动生成随机口令并随文件保存，打开时无需输入（拿到文件即可打开）。
 func Create(name, bucket string, acc *model.Account, ttl time.Duration, password string) ([]byte, error) {
-	if password == "" {
-		return nil, errors.New("分享口令不能为空")
-	}
 	if bucket == "" {
 		return nil, errors.New("桶名不能为空")
 	}
@@ -106,6 +110,12 @@ func Create(name, bucket string, acc *model.Account, ttl time.Duration, password
 	if err != nil {
 		return nil, err
 	}
+	// 免口令模式：随机口令写入文件，接收方无需输入
+	unlockCode := ""
+	if password == "" {
+		password = randomCode()
+		unlockCode = password
+	}
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return nil, err
@@ -123,10 +133,25 @@ func Create(name, bucket string, acc *model.Account, ttl time.Duration, password
 		ArgonThreads: crypto.Argon2Threads,
 		Salt:         crypto.EncodeBase64(salt),
 		Payload:      enc,
+		UnlockCode:   unlockCode,
 	}, "", "  ")
 }
 
+// randomCode 生成 8 位随机口令（去掉 0/O/1/l/I 等易混淆字符）。
+func randomCode() string {
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "s3share"
+	}
+	for i := range buf {
+		buf[i] = chars[int(buf[i])%len(chars)]
+	}
+	return string(buf)
+}
+
 // Open 用分享口令解密配置，返回只读会话。
+// password 为空时若文件是「免口令」的则直接打开，否则返回 ErrPasswordRequired。
 // 口令错误、文件损坏或被篡改都会返回错误（AES-GCM 认证失败）。
 func Open(data []byte, password string) (*Session, error) {
 	var f file
@@ -135,6 +160,12 @@ func Open(data []byte, password string) (*Session, error) {
 	}
 	if f.Version != Version {
 		return nil, fmt.Errorf("不支持的分享配置版本: %d", f.Version)
+	}
+	if password == "" {
+		if f.UnlockCode == "" {
+			return nil, ErrPasswordRequired
+		}
+		password = f.UnlockCode
 	}
 	salt, err := crypto.DecodeBase64(f.Salt)
 	if err != nil {

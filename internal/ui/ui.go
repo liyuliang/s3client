@@ -3,6 +3,7 @@ package ui
 import (
 	_ "embed"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"image/color"
 	"context"
@@ -123,18 +124,24 @@ func showUnlock(w fyne.Window) {
 			dialog.ShowError(err, w)
 			return
 		}
-		showMain(w, s)
+		showMain(w, s, nil)
 	}
 	pwd.OnSubmitted = func(string) { doUnlock() }
 
 	btn := widget.NewButtonWithIcon(action, theme.ConfirmIcon(), doUnlock)
 
+	// 不需要账号库也能查看别人分享的 bucket（只读）
+	shareBtn := widget.NewButtonWithIcon("加载分享配置（无需解锁）", theme.MailAttachmentIcon(), func() {
+		loadShare(w, func(sess *share.Session) { showMain(w, nil, sess) })
+	})
+
 	inputRow := container.NewBorder(nil, nil, nil, btn, pwd)
 	box := container.NewVBox(
 		widget.NewLabelWithStyle(title, fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		inputRow,
+		shareBtn,
 	)
-	card := container.NewGridWrap(fyne.NewSize(420, 96), box)
+	card := container.NewGridWrap(fyne.NewSize(420, 140), box)
 	w.SetContent(container.NewCenter(card))
 }
 
@@ -369,8 +376,27 @@ func loadShare(w fyne.Window, onLoaded func(*share.Session)) {
 			fyne.Do(func() { dialog.ShowError(rerr, w) })
 			return
 		}
-		fyne.Do(func() { askSharePassword(w, data, onLoaded) })
+		fyne.Do(func() { openShareConfig(w, data, onLoaded) })
 	}()
+}
+
+// openShareConfig 打开分享配置：免口令文件直接打开，需要口令时才弹输入框。
+func openShareConfig(w fyne.Window, data []byte, onOK func(*share.Session)) {
+	sess, err := share.Open(data, "")
+	if errors.Is(err, share.ErrPasswordRequired) {
+		askSharePassword(w, data, onOK)
+		return
+	}
+	if err != nil {
+		dialog.ShowError(err, w)
+		return
+	}
+	if sess.Expired() {
+		showInfo("分享已过期",
+			fmt.Sprintf("该分享的有效期已于 %s 结束，无法使用。", sess.ExpiresAt.Local().Format("2006-01-02 15:04")), w)
+		return
+	}
+	onOK(sess)
 }
 
 // askSharePassword 弹出输入分享口令的对话框，解密失败/已过期都会提示。
@@ -461,7 +487,7 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 	form := widget.NewForm(
 		widget.NewFormItem("分享名称", nameEntry),
 		widget.NewFormItem("有效期(小时, 0=不限)", hoursEntry),
-		widget.NewFormItem("分享口令(自动生成, 可修改)", pw),
+		widget.NewFormItem("分享口令(自动生成, 可改, 留空=免口令)", pw),
 	)
 	// 实时回显有效期，便于确认输入是否生效
 	hint := widget.NewLabel("")
@@ -485,10 +511,6 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 		if !ok {
 			return
 		}
-		if pw.Text == "" {
-			showInfo("提示", "分享口令不能为空", w)
-			return
-		}
 		hours := 0
 		if v, err := fmt.Sscanf(hoursEntry.Text, "%d", &hours); err != nil || v != 1 || hours < 0 {
 			hours = 0
@@ -502,6 +524,11 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 		expText := "不限期（0 小时）"
 		if ttl > 0 {
 			expText = fmt.Sprintf("%d 小时（至 %s）", hours, time.Now().Add(ttl).Local().Format("2006-01-02 15:04"))
+		}
+		// 留空口令 = 免口令：随机口令随文件保存，对方拿到文件即可打开
+		pwText := "免口令（口令随文件保存，对方无需输入）"
+		if pw.Text != "" {
+			pwText = "分享口令：" + pw.Text
 		}
 		go func() {
 			savePath, zerr := zenity.SelectFileSave(
@@ -519,8 +546,8 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 					return
 				}
 				showInfo("完成", fmt.Sprintf(
-					"已生成只读分享配置：\n%s\n\n有效期：%s\n\n分享口令：%s\n\n请把分享口令另行告知对方（口令不会保存在文件里）。",
-					savePath, expText, pw.Text), w)
+					"已生成只读分享配置：\n%s\n\n有效期：%s\n\n%s",
+					savePath, expText, pwText), w)
 			})
 		}()
 	}, w)
@@ -535,7 +562,8 @@ func accountLabel(name string, isSharePoint bool) string {
 }
 
 // showMain 显示账号管理主界面：左侧账号，右侧 Bucket/对象浏览。
-func showMain(w fyne.Window, s *store.Store) {
+// s 为 nil 表示未解锁账号库（只用分享配置浏览），initialShare 非 nil 时会自动打开该分享。
+func showMain(w fyne.Window, s *store.Store, initialShare *share.Session) {
 	var accounts []model.Account
 	var rows []*tappableRow
 	selected := -1
@@ -609,6 +637,9 @@ func showMain(w fyne.Window, s *store.Store) {
 
 	// 分享会话是只存在于内存中的只读条目，不写入账号库。
 	var sessions []*share.Session
+	if initialShare != nil {
+		sessions = append(sessions, initialShare)
+	}
 
 	// 选中分享行时清空账号选中项，避免菜单栏的账号操作误用。
 	selectShareRow := func(idx int) {
@@ -621,11 +652,15 @@ func showMain(w fyne.Window, s *store.Store) {
 	var reload func()
 	var doEdit, doDelete, doTest func(acc model.Account)
 	reload = func() {
-		var err error
-		accounts, err = s.ListAccounts()
-		if err != nil {
-			dialog.ShowError(err, w)
-			return
+		if s != nil {
+			var err error
+			accounts, err = s.ListAccounts()
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+		} else {
+			accounts = nil
 		}
 		rows = nil
 		accountList.Objects = nil
@@ -689,6 +724,14 @@ func showMain(w fyne.Window, s *store.Store) {
 	}
 	reload()
 
+	// 从解锁界面加载进来的分享：直接打开它的 tab
+	if initialShare != nil {
+		first := initialShare
+		openTab(fmt.Sprintf("share:%p", first), fmt.Sprintf("🔒 %s（只读）", first.Name), func(setRight func(fyne.CanvasObject)) {
+			openShare(w, setRight, first)
+		})
+	}
+
 	doEdit = func(acc model.Account) {
 		editAccount(w, s, &acc, reload)
 	}
@@ -733,7 +776,11 @@ func showMain(w fyne.Window, s *store.Store) {
 		}()
 	}
 
-	panelTitle := widget.NewLabelWithStyle("账号（右键可编辑/删除/测试）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	panelTitleText := "账号（右键可编辑/删除/测试）"
+	if s == nil {
+		panelTitleText = "分享（未解锁账号库，右键可查看信息/移除）"
+	}
+	panelTitle := widget.NewLabelWithStyle(panelTitleText, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	leftPanel := container.NewBorder(panelTitle, nil, nil, nil, accountScroll)
 
 	lockItem := fyne.NewMenuItem("加锁", func() {
@@ -878,12 +925,18 @@ func showMain(w fyne.Window, s *store.Store) {
 		sessions = append(sessions, sess)
 		reload()
 	}) })
-	accountMenu := fyne.NewMenu("账号", addItem, editItem, delItem, testItem,
-		fyne.NewMenuItemSeparator(), exportItem, importItem)
 	shareMenu := fyne.NewMenu("分享", loadShareItem)
-	securityMenu := fyne.NewMenu("安全", lockItem, changePwItem)
-	storageMenu := fyne.NewMenu("存储", locItem)
-	w.SetMainMenu(fyne.NewMainMenu(accountMenu, shareMenu, securityMenu, storageMenu))
+	if s == nil {
+		// 未解锁账号库：只提供分享浏览与回到解锁界面
+		unlockItem := fyne.NewMenuItem("解锁账号库...", func() { showUnlock(w) })
+		w.SetMainMenu(fyne.NewMainMenu(fyne.NewMenu("文件", unlockItem), shareMenu))
+	} else {
+		accountMenu := fyne.NewMenu("账号", addItem, editItem, delItem, testItem,
+			fyne.NewMenuItemSeparator(), exportItem, importItem)
+		securityMenu := fyne.NewMenu("安全", lockItem, changePwItem)
+		storageMenu := fyne.NewMenu("存储", locItem)
+		w.SetMainMenu(fyne.NewMainMenu(accountMenu, shareMenu, securityMenu, storageMenu))
+	}
 
 	split := container.NewHSplit(leftPanel, rightPanel)
 	split.Offset = 0.3
