@@ -463,9 +463,25 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 		widget.NewFormItem("有效期(小时, 0=不限)", hoursEntry),
 		widget.NewFormItem("分享口令(自动生成, 可修改)", pw),
 	)
+	// 实时回显有效期，便于确认输入是否生效
+	hint := widget.NewLabel("")
+	updateHint := func(text string) {
+		h := 0
+		if v, err := fmt.Sscanf(text, "%d", &h); err != nil || v != 1 || h < 0 {
+			h = 0
+		}
+		if h == 0 {
+			hint.SetText("有效期至：不限期")
+			return
+		}
+		hint.SetText("有效期至：" + time.Now().Add(time.Duration(h)*time.Hour).Local().Format("2006-01-02 15:04"))
+	}
+	hoursEntry.OnChanged = updateHint
+	updateHint(hoursEntry.Text)
 	scroll := container.NewVScroll(form)
 	scroll.SetMinSize(fyne.NewSize(420, 260))
-	dialog.ShowCustomConfirm("生成只读分享配置", "生成并保存", "取消", scroll, func(ok bool) {
+	dialog.ShowCustomConfirm("生成只读分享配置", "生成并保存", "取消",
+		container.NewVBox(scroll, hint), func(ok bool) {
 		if !ok {
 			return
 		}
@@ -483,9 +499,9 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 			dialog.ShowError(err, w)
 			return
 		}
-		expText := "不限期"
+		expText := "不限期（0 小时）"
 		if ttl > 0 {
-			expText = time.Now().Add(ttl).Local().Format("2006-01-02 15:04")
+			expText = fmt.Sprintf("%d 小时（至 %s）", hours, time.Now().Add(ttl).Local().Format("2006-01-02 15:04"))
 		}
 		go func() {
 			savePath, zerr := zenity.SelectFileSave(
@@ -503,11 +519,19 @@ func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
 					return
 				}
 				showInfo("完成", fmt.Sprintf(
-					"已生成只读分享配置：\n%s\n\n有效期至：%s\n\n分享口令：%s\n\n请把分享口令另行告知对方（口令不会保存在文件里）。",
+					"已生成只读分享配置：\n%s\n\n有效期：%s\n\n分享口令：%s\n\n请把分享口令另行告知对方（口令不会保存在文件里）。",
 					savePath, expText, pw.Text), w)
 			})
 		}()
 	}, w)
+}
+
+// accountLabel 返回带类型标记的账号显示名：S3 账号标「S3」，SharePoint 账号标「SP」。
+func accountLabel(name string, isSharePoint bool) string {
+	if isSharePoint {
+		return name + "（SP）"
+	}
+	return name + "（S3）"
 }
 
 // showMain 显示账号管理主界面：左侧账号，右侧 Bucket/对象浏览。
@@ -519,11 +543,61 @@ func showMain(w fyne.Window, s *store.Store) {
 	accountList := container.NewVBox()
 	accountScroll := container.NewVScroll(accountList)
 
+	// 右侧：每个账号一个 tab，切换 tab 不重新加载。
+	// tab 的内容是一个 Stack，账号内导航（bucket → 目录）只替换该 tab 内部的内容。
 	rightPanel := container.NewStack(widget.NewLabel("双击左侧账号查看其 Bucket"))
-
-	setRight := func(obj fyne.CanvasObject) {
-		rightPanel.Objects = []fyne.CanvasObject{obj}
+	tabs := container.NewAppTabs()
+	tabsShown := false
+	showTabs := func() {
+		if tabsShown {
+			return
+		}
+		tabsShown = true
+		rightPanel.Objects = []fyne.CanvasObject{tabs}
 		rightPanel.Refresh()
+	}
+
+	type tabHandle struct {
+		item  *container.TabItem
+		panel *fyne.Container
+	}
+	tabByKey := map[string]*tabHandle{}
+
+	// openTab 打开（或切换到已存在的）tab；已存在时只切换、不重新加载。
+	openTab := func(key, title string, open func(setRight func(fyne.CanvasObject))) {
+		if h, ok := tabByKey[key]; ok {
+			tabs.Select(h.item)
+			return
+		}
+		panel := container.NewStack(widget.NewLabel("加载中..."))
+		item := container.NewTabItem(title, panel)
+		h := &tabHandle{item: item, panel: panel}
+		tabByKey[key] = h
+		tabs.Append(item)
+		tabs.Select(item)
+		showTabs()
+		open(func(obj fyne.CanvasObject) {
+			panel.Objects = []fyne.CanvasObject{obj}
+			panel.Refresh()
+		})
+	}
+
+	// closeTabsNotIn 删除账号/分享已不存在的 tab，并同步 tab 标题。
+	syncTabs := func(keep map[string]string) {
+		if len(tabByKey) == 0 {
+			return
+		}
+		var items []*container.TabItem
+		for key, h := range tabByKey {
+			if title, ok := keep[key]; ok {
+				h.item.Text = title
+				items = append(items, h.item)
+				continue
+			}
+			delete(tabByKey, key)
+		}
+		tabs.SetItems(items)
+		tabs.Refresh()
 	}
 
 	selectRow := func(idx int) {
@@ -558,16 +632,18 @@ func showMain(w fyne.Window, s *store.Store) {
 		for i := range accounts {
 			idx := i
 			acc := accounts[i]
-			row := newTappableRow(acc.Name, theme.AccountIcon(),
+			row := newTappableRow(accountLabel(acc.Name, acc.IsSharePoint()), theme.AccountIcon(),
 				func() { selectRow(idx) },
 				func() {
-				selectRow(idx)
-				if acc.IsSharePoint() {
-					showSharePointDrives(w, setRight, s, &acc)
-				} else {
-					showBuckets(w, setRight, s, &acc)
-				}
-			},
+					selectRow(idx)
+					openTab(fmt.Sprintf("acc:%d", acc.ID), accountLabel(acc.Name, acc.IsSharePoint()), func(setRight func(fyne.CanvasObject)) {
+						if acc.IsSharePoint() {
+							showSharePointDrives(w, setRight, s, &acc)
+						} else {
+							showBuckets(w, setRight, s, &acc)
+						}
+					})
+				},
 			).withSecondaryMenu(
 				fyne.NewMenuItem("编辑账号...", func() { selectRow(idx); doEdit(acc) }),
 				fyne.NewMenuItem("删除账号", func() { selectRow(idx); doDelete(acc) }),
@@ -576,7 +652,13 @@ func showMain(w fyne.Window, s *store.Store) {
 			rows = append(rows, row)
 			accountList.Add(row)
 		}
+		keep := map[string]string{}
+		for _, a := range accounts {
+			keep[fmt.Sprintf("acc:%d", a.ID)] = accountLabel(a.Name, a.IsSharePoint())
+		}
 		for i, sess := range sessions {
+			key := fmt.Sprintf("share:%p", sess)
+			keep[key] = fmt.Sprintf("🔒 %s（只读）", sess.Name)
 			idx := len(accounts) + i
 			si := i
 			cur := sess
@@ -586,7 +668,11 @@ func showMain(w fyne.Window, s *store.Store) {
 			}
 			row := newTappableRow(fmt.Sprintf("🔒 %s（只读，%s）", cur.Name, expText), theme.MailAttachmentIcon(),
 				func() { selectShareRow(idx) },
-				func() { openShare(w, setRight, cur) },
+				func() {
+					openTab(key, fmt.Sprintf("🔒 %s（只读）", cur.Name), func(setRight func(fyne.CanvasObject)) {
+						openShare(w, setRight, cur)
+					})
+				},
 			).withSecondaryMenu(
 				fyne.NewMenuItem("分享信息...", func() { showShareInfo(w, cur) }),
 				fyne.NewMenuItem("移除该分享", func() {
@@ -597,6 +683,7 @@ func showMain(w fyne.Window, s *store.Store) {
 			rows = append(rows, row)
 			accountList.Add(row)
 		}
+		syncTabs(keep)
 		selected = -1
 		accountList.Refresh()
 	}
