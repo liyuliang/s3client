@@ -2,6 +2,7 @@ package awss3
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -100,6 +101,48 @@ func ListObjects(a *model.Account, bucket, prefix string) ([]Object, error) {
 	return objects, nil
 }
 
+// ListObjectsRecursive 递归列出 prefix 下的所有文件对象（不再按 / 分层），用于整个文件夹下载。
+// 返回的 Name 是相对 prefix 的路径（可能包含子目录）。
+func ListObjectsRecursive(a *model.Account, bucket, prefix string) ([]Object, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	client := newClient(a)
+	var objects []Object
+	var token *string
+	for {
+		out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			Prefix:            &prefix,
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range out.Contents {
+			k := aws.ToString(obj.Key)
+			if k == prefix || strings.HasSuffix(k, "/") {
+				continue // 跳过自身与文件夹占位对象
+			}
+			name := strings.TrimPrefix(k, prefix)
+			if name == "" {
+				name = k[strings.LastIndex(k, "/")+1:]
+			}
+			objects = append(objects, Object{
+				Key:          k,
+				Name:         name,
+				Size:         aws.ToInt64(obj.Size),
+				Type:         fileType(name),
+				LastModified: aws.ToTime(obj.LastModified),
+			})
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return objects, nil
+}
+
 // progressReader 包装 io.ReadSeeker，每次读取后回调进度（用于上传）。
 type progressReader struct {
 	r     io.ReadSeeker
@@ -142,8 +185,22 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// ErrReadOnly 表示当前账号是只读分享，不允许写入。
+var ErrReadOnly = errors.New("只读分享配置，禁止写入操作")
+
+// checkWritable 拦截只读账号的写操作（分享配置加载的账号只读）。
+func checkWritable(a *model.Account) error {
+	if a != nil && a.ReadOnly {
+		return ErrReadOnly
+	}
+	return nil
+}
+
 // UploadFile 上传本地文件到 bucket/key，progress 回调可为 nil。
 func UploadFile(a *model.Account, bucket, key, localPath string, progress func(done, total int64)) error {
+	if err := checkWritable(a); err != nil {
+		return err
+	}
 	f, err := os.Open(localPath)
 	if err != nil {
 		return err
@@ -184,6 +241,12 @@ func DownloadFile(a *model.Account, bucket, key, localPath string, progress func
 	}
 	defer out.Body.Close()
 
+	// 下载整个文件夹时对象 key 含子目录，需先建立本地父目录。
+	if dir := filepath.Dir(localPath); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
 	f, err := os.Create(localPath)
 	if err != nil {
 		return err
@@ -197,6 +260,9 @@ func DownloadFile(a *model.Account, bucket, key, localPath string, progress func
 
 // DeleteObject 删除 bucket/key 指向的对象。
 func DeleteObject(a *model.Account, bucket, key string) error {
+	if err := checkWritable(a); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	client := newClient(a)
@@ -209,6 +275,9 @@ func DeleteObject(a *model.Account, bucket, key string) error {
 
 // CreateFolder 在 bucket 的 prefix 下创建一个名为 name 的"文件夹"（S3 用以 / 结尾的空对象表示）。
 func CreateFolder(a *model.Account, bucket, prefix, name string) error {
+	if err := checkWritable(a); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	client := newClient(a)

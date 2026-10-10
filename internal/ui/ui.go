@@ -2,9 +2,11 @@ package ui
 
 import (
 	_ "embed"
+	"crypto/rand"
 	"fmt"
 	"image/color"
 	"context"
+	mrand "math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 
 	"s3client/internal/awss3"
 	"s3client/internal/model"
+	"s3client/internal/share"
 	"s3client/internal/sharepoint"
 	"s3client/internal/store"
 )
@@ -172,7 +175,13 @@ type tappableRow struct {
 	onDoubleTap   func()
 	secondaryTap  func()
 	secondaryMenu []*fyne.MenuItem
+	lastTap       time.Time
 }
+
+// rowDoubleTapDelay 本行自己判定双击的间隔。
+// 行不实现 fyne.DoubleTappable：否则 Fyne 会让单击进入双击等待，
+// 连续点击多个文件时前一次的单击会被取消，导致勾选完全不生效。
+const rowDoubleTapDelay = 400 * time.Millisecond
 
 func (r *tappableRow) withSecondary(fn func()) *tappableRow {
 	r.secondaryTap = fn
@@ -191,7 +200,7 @@ func (r *tappableRow) withColor(c color.Color) *tappableRow {
 }
 
 // withCheck 给行左侧加一个复选框（用于多选下载），勾选状态变化时回调。
-// 加了复选框后，单击行（除复选框本身以外的位置）会切换勾选状态。
+// 加了复选框后，单击行（除复选框本身以外的位置）会自动勾上；点复选框本身可切换。
 func (r *tappableRow) withCheck(onChanged func(bool)) *tappableRow {
 	r.check = widget.NewCheck("", onChanged)
 	return r
@@ -221,18 +230,21 @@ func newTappableRowDetail(text string, meta []string, icon fyne.Resource, onTapp
 	return r
 }
 
+// Tapped 处理左键单击：行有双击动作时，短时间内第二次单击视为双击；
+// 带复选框的行单击即勾上（取消勾选请点复选框本身）。
 func (r *tappableRow) Tapped(_ *fyne.PointEvent) {
+	now := time.Now()
+	if r.onDoubleTap != nil && !r.lastTap.IsZero() && now.Sub(r.lastTap) <= rowDoubleTapDelay {
+		r.lastTap = time.Time{}
+		r.onDoubleTap()
+		return
+	}
+	r.lastTap = now
 	if r.onTapped != nil {
 		r.onTapped()
 	}
 	if r.check != nil {
-		r.check.SetChecked(!r.check.Checked)
-	}
-}
-
-func (r *tappableRow) DoubleTapped(_ *fyne.PointEvent) {
-	if r.onDoubleTap != nil {
-		r.onDoubleTap()
+		r.check.SetChecked(true)
 	}
 }
 
@@ -345,6 +357,159 @@ func showProperties(w fyne.Window, title string, props [][2]string) {
 	dialog.ShowCustom(title, "关闭", content, w)
 }
 
+// loadShare 选择一个分享配置文件并用口令解密，成功后回调只读会话。
+func loadShare(w fyne.Window, onLoaded func(*share.Session)) {
+	go func() {
+		path, zerr := zenity.SelectFile(zenity.Title("选择分享配置文件（.s3share）"))
+		if zerr != nil {
+			return
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			fyne.Do(func() { dialog.ShowError(rerr, w) })
+			return
+		}
+		fyne.Do(func() { askSharePassword(w, data, onLoaded) })
+	}()
+}
+
+// askSharePassword 弹出输入分享口令的对话框，解密失败/已过期都会提示。
+func askSharePassword(w fyne.Window, data []byte, onOK func(*share.Session)) {
+	pw := widget.NewPasswordEntry()
+	pw.SetPlaceHolder("分享口令")
+	content := container.NewVScroll(pw)
+	content.SetMinSize(fyne.NewSize(360, 60))
+	dialog.ShowCustomConfirm("加载分享配置", "确定", "取消", content, func(ok bool) {
+		if !ok || pw.Text == "" {
+			return
+		}
+		sess, err := share.Open(data, pw.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		if sess.Expired() {
+			showInfo("分享已过期",
+				fmt.Sprintf("该分享的有效期已于 %s 结束，无法使用。", sess.ExpiresAt.Local().Format("2006-01-02 15:04")), w)
+			return
+		}
+		onOK(sess)
+	}, w)
+}
+
+// checkShareValid 只读分享过期时提示并返回 false。
+func checkShareValid(w fyne.Window, acc *model.Account) bool {
+	if acc == nil || !acc.ShareExpired() {
+		return true
+	}
+	showInfo("分享已过期",
+		fmt.Sprintf("该分享的有效期已于 %s 结束，无法继续使用。", acc.ShareExpiresAt.Local().Format("2006-01-02 15:04")), w)
+	return false
+}
+
+// openShare 双击分享条目：校验有效期后直接进入该 bucket（只读）。
+func openShare(w fyne.Window, setRight func(fyne.CanvasObject), sess *share.Session) {
+	if sess.Expired() {
+		showInfo("分享已过期",
+			fmt.Sprintf("该分享的有效期已于 %s 结束，无法使用。", sess.ExpiresAt.Local().Format("2006-01-02 15:04")), w)
+		return
+	}
+	showObjects(w, setRight, nil, sess.Account, sess.Bucket, "")
+}
+
+// showShareInfo 显示分享配置的基本信息（不含任何凭据）。
+func showShareInfo(w fyne.Window, sess *share.Session) {
+	exp := "不限期"
+	if !sess.ExpiresAt.IsZero() {
+		exp = sess.ExpiresAt.Local().Format("2006-01-02 15:04")
+	}
+	showProperties(w, "分享信息", [][2]string{
+		{"名称", sess.Name},
+		{"Bucket", sess.Bucket},
+		{"权限", "只读（禁止上传/删除/新建文件夹）"},
+		{"有效期至", exp},
+		{"状态", sess.Remaining()},
+	})
+}
+
+// shareCodeLen 分享口令长度。
+const shareCodeLen = 8
+
+// randomShareCode 生成 8 位随机分享口令（去掉 0/O/1/l/I 等易混淆字符）。
+func randomShareCode() string {
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+	buf := make([]byte, shareCodeLen)
+	if _, err := rand.Read(buf); err != nil {
+		for i := range buf {
+			buf[i] = byte(mrand.IntN(256))
+		}
+	}
+	for i := range buf {
+		buf[i] = chars[int(buf[i])%len(chars)]
+	}
+	return string(buf)
+}
+
+// showCreateShare 生成当前 bucket 的只读分享配置并保存到文件。
+func showCreateShare(w fyne.Window, acc *model.Account, bucket string) {
+	nameEntry := widget.NewEntry()
+	nameEntry.SetText(bucket)
+	hoursEntry := widget.NewEntry()
+	hoursEntry.SetText("24")
+	pw := widget.NewEntry()
+	pw.SetText(randomShareCode())
+	form := widget.NewForm(
+		widget.NewFormItem("分享名称", nameEntry),
+		widget.NewFormItem("有效期(小时, 0=不限)", hoursEntry),
+		widget.NewFormItem("分享口令(自动生成, 可修改)", pw),
+	)
+	scroll := container.NewVScroll(form)
+	scroll.SetMinSize(fyne.NewSize(420, 260))
+	dialog.ShowCustomConfirm("生成只读分享配置", "生成并保存", "取消", scroll, func(ok bool) {
+		if !ok {
+			return
+		}
+		if pw.Text == "" {
+			showInfo("提示", "分享口令不能为空", w)
+			return
+		}
+		hours := 0
+		if v, err := fmt.Sscanf(hoursEntry.Text, "%d", &hours); err != nil || v != 1 || hours < 0 {
+			hours = 0
+		}
+		ttl := time.Duration(hours) * time.Hour
+		data, err := share.Create(nameEntry.Text, bucket, acc, ttl, pw.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		expText := "不限期"
+		if ttl > 0 {
+			expText = time.Now().Add(ttl).Local().Format("2006-01-02 15:04")
+		}
+		go func() {
+			savePath, zerr := zenity.SelectFileSave(
+				zenity.Title("保存分享配置文件"),
+				zenity.Filename(bucket+"-readonly.s3share"),
+				zenity.ConfirmOverwrite(),
+			)
+			if zerr != nil {
+				return
+			}
+			werr := os.WriteFile(savePath, data, 0600)
+			fyne.Do(func() {
+				if werr != nil {
+					dialog.ShowError(werr, w)
+					return
+				}
+				showInfo("完成", fmt.Sprintf(
+					"已生成只读分享配置：\n%s\n\n有效期至：%s\n\n分享口令：%s\n\n请把分享口令另行告知对方（口令不会保存在文件里）。",
+					savePath, expText, pw.Text), w)
+			})
+		}()
+	}, w)
+}
+
 // showMain 显示账号管理主界面：左侧账号，右侧 Bucket/对象浏览。
 func showMain(w fyne.Window, s *store.Store) {
 	var accounts []model.Account
@@ -366,6 +531,17 @@ func showMain(w fyne.Window, s *store.Store) {
 			r.setSelected(i == idx)
 		}
 		selected = idx
+	}
+
+	// 分享会话是只存在于内存中的只读条目，不写入账号库。
+	var sessions []*share.Session
+
+	// 选中分享行时清空账号选中项，避免菜单栏的账号操作误用。
+	selectShareRow := func(idx int) {
+		for i, r := range rows {
+			r.setSelected(i == idx)
+		}
+		selected = -1
 	}
 
 	var reload func()
@@ -396,6 +572,27 @@ func showMain(w fyne.Window, s *store.Store) {
 				fyne.NewMenuItem("编辑账号...", func() { selectRow(idx); doEdit(acc) }),
 				fyne.NewMenuItem("删除账号", func() { selectRow(idx); doDelete(acc) }),
 				fyne.NewMenuItem("测试连接", func() { selectRow(idx); doTest(acc) }),
+			)
+			rows = append(rows, row)
+			accountList.Add(row)
+		}
+		for i, sess := range sessions {
+			idx := len(accounts) + i
+			si := i
+			cur := sess
+			expText := "不限期"
+			if !cur.ExpiresAt.IsZero() {
+				expText = "有效期至" + cur.ExpiresAt.Local().Format("2006-01-02 15:04")
+			}
+			row := newTappableRow(fmt.Sprintf("🔒 %s（只读，%s）", cur.Name, expText), theme.MailAttachmentIcon(),
+				func() { selectShareRow(idx) },
+				func() { openShare(w, setRight, cur) },
+			).withSecondaryMenu(
+				fyne.NewMenuItem("分享信息...", func() { showShareInfo(w, cur) }),
+				fyne.NewMenuItem("移除该分享", func() {
+					sessions = append(sessions[:si], sessions[si+1:]...)
+					reload()
+				}),
 			)
 			rows = append(rows, row)
 			accountList.Add(row)
@@ -590,11 +787,16 @@ func showMain(w fyne.Window, s *store.Store) {
 			doTest(acc)
 		}
 	})
+	loadShareItem := fyne.NewMenuItem("加载分享配置...", func() { loadShare(w, func(sess *share.Session) {
+		sessions = append(sessions, sess)
+		reload()
+	}) })
 	accountMenu := fyne.NewMenu("账号", addItem, editItem, delItem, testItem,
 		fyne.NewMenuItemSeparator(), exportItem, importItem)
+	shareMenu := fyne.NewMenu("分享", loadShareItem)
 	securityMenu := fyne.NewMenu("安全", lockItem, changePwItem)
 	storageMenu := fyne.NewMenu("存储", locItem)
-	w.SetMainMenu(fyne.NewMainMenu(accountMenu, securityMenu, storageMenu))
+	w.SetMainMenu(fyne.NewMainMenu(accountMenu, shareMenu, securityMenu, storageMenu))
 
 	split := container.NewHSplit(leftPanel, rightPanel)
 	split.Offset = 0.3
@@ -659,7 +861,8 @@ func showObjects(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store
 
 	go func() {
 		objects, err := awss3.ListObjects(acc, bucket, prefix)
-		if err == nil {
+		// 只读分享没有账号库记录，也不记录上次目录。
+		if err == nil && s != nil && !acc.ReadOnly {
 			_ = s.SetBucketPrefix(acc.ID, bucket, prefix)
 		}
 		fyne.Do(func() {
@@ -854,6 +1057,13 @@ func runParallelTransfers(w fyne.Window, progressArea *fyne.Container, tasks []t
 
 // buildObjectView 构建对象浏览器：面包屑 + 过滤框 + 文件/文件夹列表 + 底部操作栏 + 进度条。
 func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.Store, acc *model.Account, bucket, prefix string, objects []awss3.Object, errMsg string) {
+	readOnly := acc.ReadOnly
+	if readOnly && acc.ShareExpired() {
+		setRight(widget.NewLabel(fmt.Sprintf("🔒 该分享配置的有效期已于 %s 结束，无法继续访问。",
+			acc.ShareExpiresAt.Local().Format("2006-01-02 15:04"))))
+		return
+	}
+
 	var rows []*tappableRow
 	var selectedObj *awss3.Object
 	selectedKeys := map[string]*awss3.Object{}
@@ -893,15 +1103,18 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.S
 			delete(selectedKeys, k)
 		}
 
-		backBtn := newTappableRow("⬆ 返回上一级", theme.NavigateBackIcon(), nil, func() {
-			if prefix == "" {
-				showBuckets(w, setRight, s, acc)
-				return
-			}
-			showObjects(w, setRight, s, acc, bucket, parentPrefix(prefix))
-		})
-		rows = append(rows, backBtn)
-		list.Add(backBtn)
+		// 只读分享没有账号库，根目录无法回退到 bucket 列表，因此不显示返回行。
+		if !(readOnly && prefix == "") {
+			backBtn := newTappableRow("⬆ 返回上一级", theme.NavigateBackIcon(), nil, func() {
+				if prefix == "" {
+					showBuckets(w, setRight, s, acc)
+					return
+				}
+				showObjects(w, setRight, s, acc, bucket, parentPrefix(prefix))
+			})
+			rows = append(rows, backBtn)
+			list.Add(backBtn)
+		}
 
 		for _, o := range objects {
 			obj := o
@@ -916,6 +1129,13 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.S
 						{"Key", obj.Key},
 						{"类型", "文件夹"},
 					})
+				}).withCheck(func(checked bool) {
+					if checked {
+						selectedKeys[obj.Key] = &obj
+					} else {
+						delete(selectedKeys, obj.Key)
+					}
+					selectRow(idx, &obj)
 				})
 				rows = append(rows, row)
 				filterRows = append(filterRows, filterRow{row: row, name: strings.ToLower(obj.Name)})
@@ -1000,9 +1220,12 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.S
 		}()
 	})
 
-	downloadBtn := widget.NewButtonWithIcon("下载文件", theme.DownloadIcon(), func() {
+	downloadBtn := widget.NewButtonWithIcon("下载", theme.DownloadIcon(), func() {
 		if len(selectedKeys) == 0 {
-			showInfo("提示", "请先勾选要下载的文件（文件行左侧复选框）", w)
+			showInfo("提示", "请先勾选要下载的文件或文件夹（行左侧复选框）", w)
+			return
+		}
+		if !checkShareValid(w, acc) {
 			return
 		}
 		picked := make([]*awss3.Object, 0, len(selectedKeys))
@@ -1015,19 +1238,49 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.S
 				return
 			}
 			tasks := make([]transferTask, 0, len(picked))
-			for _, o := range picked {
-				obj := o
-				savePath := filepath.Join(dir, obj.Name)
+			firstPath := ""
+			addTask := func(display, key, local string) {
+				if firstPath == "" {
+					firstPath = local
+				}
 				tasks = append(tasks, transferTask{
-					name: obj.Name,
+					name: display,
 					run: func(progress func(done, total int64)) error {
-						return awss3.DownloadFile(acc, bucket, obj.Key, savePath, progress)
+						return awss3.DownloadFile(acc, bucket, key, local, progress)
 					},
 				})
 			}
-			firstPath := filepath.Join(dir, picked[0].Name)
+			for _, o := range picked {
+				obj := o
+				if !obj.IsDir {
+					addTask(obj.Name, obj.Key, filepath.Join(dir, filepath.FromSlash(obj.Name)))
+					continue
+				}
+				// 文件夹：递归列出其内部所有文件，按相对路径落盘（保留子目录结构）。
+				items, lerr := awss3.ListObjectsRecursive(acc, bucket, obj.Key)
+				if lerr != nil {
+					fyne.Do(func() { dialog.ShowError(lerr, w) })
+					return
+				}
+				// 下载结果形如 <目标目录>/<文件夹名>/<相对路径>
+				base := strings.TrimSuffix(obj.Key, "/")
+				if i := strings.LastIndex(base, "/"); i >= 0 {
+					base = base[:i+1]
+				} else {
+					base = ""
+				}
+				for _, it := range items {
+					rel := strings.TrimPrefix(it.Key, base)
+					addTask(rel, it.Key, filepath.Join(dir, filepath.FromSlash(rel)))
+				}
+			}
+			if len(tasks) == 0 {
+				fyne.Do(func() { showInfo("提示", "所选文件夹内没有可下载的文件", w) })
+				return
+			}
+			first := firstPath
 			fyne.Do(func() {
-				runParallelTransfers(w, progressArea, tasks, func() { revealInExplorer(firstPath) })
+				runParallelTransfers(w, progressArea, tasks, func() { revealInExplorer(first) })
 			})
 		}()
 	})
@@ -1127,7 +1380,16 @@ func buildObjectView(w fyne.Window, setRight func(fyne.CanvasObject), s *store.S
 			}, w)
 	})
 
-	actionBar := container.NewHBox(refreshBtn, uploadBtn, downloadBtn, deleteBtn, urlBtn, mkdirBtn)
+	// 只读分享只提供浏览与下载，不给上传/删除/新建文件夹的入口；
+	// awss3 层对只读账号还有一道写入拦截作为兜底。
+	bar := []fyne.CanvasObject{refreshBtn, downloadBtn, urlBtn}
+	if !readOnly {
+		shareBtn := widget.NewButtonWithIcon("分享只读", theme.MailSendIcon(), func() {
+			showCreateShare(w, acc, bucket)
+		})
+		bar = []fyne.CanvasObject{refreshBtn, uploadBtn, downloadBtn, deleteBtn, urlBtn, mkdirBtn, shareBtn}
+	}
+	actionBar := container.NewHBox(bar...)
 
 	msgLabel := widget.NewLabel("")
 	msgLabel.Wrapping = fyne.TextWrapWord
